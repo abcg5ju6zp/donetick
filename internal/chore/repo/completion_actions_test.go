@@ -131,10 +131,17 @@ func TestCompletionActionsWaitForApproval(t *testing.T) {
 	require.NoError(t, db.Create(&chModel.ChoreHistory{ChoreID: chore.ID, CompletedBy: testOwnerID, PerformedAt: &now, Status: chModel.ChoreHistoryStatusPendingApproval}).Error)
 	require.NoError(t, db.First(&thing, thing.ID).Error)
 	require.Equal(t, "5", thing.State)
-	require.NoError(t, r.ApproveChore(context.Background(), chore, testOwnerID, nil, nil, false))
+	_, err := r.ApproveChore(context.Background(), ApproveInput{Chore: chore, AdminUserID: testOwnerID, ApplyPoints: false})
+	require.NoError(t, err)
 	require.NoError(t, db.First(&thing, thing.ID).Error)
 	require.Equal(t, "6", thing.State)
-	require.Error(t, r.ApproveChore(context.Background(), chore, testOwnerID, nil, nil, false))
+	// A duplicate approval is rejected as an already-decided generation and
+	// must never apply the Thing action a second time.
+	_, err = r.ApproveChore(context.Background(), ApproveInput{Chore: chore, AdminUserID: testOwnerID, ApplyPoints: false})
+	require.Error(t, err)
+	var alreadyDecided *GenerationAlreadyDecided
+	require.ErrorAs(t, err, &alreadyDecided)
+	require.Equal(t, chModel.ChoreHistoryStatusCompleted, alreadyDecided.Status)
 	require.NoError(t, db.First(&thing, thing.ID).Error)
 	require.Equal(t, "6", thing.State)
 }

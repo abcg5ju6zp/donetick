@@ -4,6 +4,8 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"errors"
+	"fmt"
 	"log"
 	"net/http"
 	"time"
@@ -85,36 +87,42 @@ func (p *EventsProducer) publishEvent(event Event) {
 }
 
 func (p *EventsProducer) processEvent(event Event) {
-	p.logger.Debugw("Sending webhook event", "type", event.Type, "url", event.URL)
+	if err := p.SendWebhookNow(context.Background(), event.URL, event); err != nil {
+		p.logger.Debugw("Failed to send webhook event", "error", err, "url", event.URL)
+	}
+}
+
+// SendWebhookNow delivers one webhook event synchronously and returns an error
+// on transport or 4xx/5xx failure. Durable retry paths (the outbox dispatcher)
+// use this instead of the fire-and-forget queue, so the same failure is simply
+// retried later without re-running any business logic.
+func (p *EventsProducer) SendWebhookNow(ctx context.Context, target string, event Event) error {
+	if target == "" {
+		return errors.New("webhook target is empty")
+	}
+	p.logger.Debugw("Sending webhook event", "type", event.Type, "url", target)
 
 	eventJSON, err := json.Marshal(event)
 	if err != nil {
-		p.logger.Errorw("Failed to marshal webhook event", "error", err)
-		return
+		return fmt.Errorf("marshal webhook event: %w", err)
 	}
 
-	// Pring the event and the url:
-	p.logger.Debug("Sending event to webhook", "url", event.URL, "event", event)
-	p.logger.Debug("Event: ", event)
-
-	req, err := http.NewRequest(METHOD_POST, event.URL, bytes.NewBuffer(eventJSON))
+	req, err := http.NewRequestWithContext(ctx, METHOD_POST, target, bytes.NewBuffer(eventJSON))
 	if err != nil {
-		p.logger.Errorw("Failed to create webhook request", "error", err)
-		return
+		return fmt.Errorf("create webhook request: %w", err)
 	}
 	req.Header.Set(HEAD_CONTENT_TYPE, CONTENT_TYPE_JSON)
 
 	resp, err := p.client.Do(req)
 	if err != nil {
-		p.logger.Debugw("Failed to send webhook event", "error", err)
-		return
+		return fmt.Errorf("send webhook event: %w", err)
 	}
 	defer resp.Body.Close()
 
 	if resp.StatusCode >= 400 {
-		p.logger.Errorw("Webhook request failed", "status", resp.StatusCode)
-		return
+		return fmt.Errorf("webhook request failed with status %d", resp.StatusCode)
 	}
+	return nil
 }
 
 func (p *EventsProducer) ChoreCreated(ctx context.Context, webhookURL *string, chore *chModel.Chore, creator *uModel.User) {
@@ -214,6 +222,13 @@ func (p *EventsProducer) SubtaskUpdated(ctx context.Context, url *string, data i
 // visible to the whole circle. The circle webhook is a circle-wide integration, so
 // such chores are never sent to it. An unloaded project counts as hidden.
 func choreHiddenFromCircle(chore *chModel.Chore) bool {
+	return ChoreHiddenFromCircle(chore)
+}
+
+// ChoreHiddenFromCircle reports whether a chore lives in a project that is not
+// visible to the whole circle. The circle webhook is a circle-wide integration,
+// so such chores are never sent to it. An unloaded project counts as hidden.
+func ChoreHiddenFromCircle(chore *chModel.Chore) bool {
 	if chore == nil {
 		return true
 	}

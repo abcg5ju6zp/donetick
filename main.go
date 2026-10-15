@@ -45,6 +45,7 @@ import (
 	"donetick.com/core/internal/notifier/service/fcm"
 	"donetick.com/core/internal/notifier/service/pushover"
 	telegram "donetick.com/core/internal/notifier/service/telegram"
+	"donetick.com/core/internal/outbox"
 	pRepo "donetick.com/core/internal/points/repo"
 	"donetick.com/core/internal/realtime"
 	"donetick.com/core/internal/resource"
@@ -156,6 +157,14 @@ func main() {
 		fx.Provide(newServer),
 		fx.Provide(notifier.NewScheduler),
 
+		// Durable external deliveries (circle webhooks + realtime broadcasts)
+		// committed alongside chore settlements and retried by the dispatcher.
+		fx.Provide(outbox.NewRepository),
+		fx.Provide(func(or *outbox.Repository, ep *events.EventsProducer, rts *realtime.RealTimeService,
+			cr *chRepo.ChoreRepository, ur *uRepo.UserRepository) *outbox.Dispatcher {
+			return outbox.NewDispatcher(or, ep, rts, cr, cr, ur)
+		}),
+
 		// things
 		fx.Provide(tRepo.NewThingRepository),
 
@@ -260,7 +269,7 @@ func main() {
 
 }
 
-func newServer(lc fx.Lifecycle, cfg *config.Config, db *gorm.DB, notifier *notifier.Scheduler, eventProducer *events.EventsProducer, mfaCleanup *mfa.CleanupService, authCleanup *auth.CleanupService, rts *realtime.RealTimeService, draftCleanup *storage.DraftCleanupService, ticketStore *realtime.TicketStore) *gin.Engine {
+func newServer(lc fx.Lifecycle, cfg *config.Config, db *gorm.DB, notifier *notifier.Scheduler, eventProducer *events.EventsProducer, mfaCleanup *mfa.CleanupService, authCleanup *auth.CleanupService, rts *realtime.RealTimeService, draftCleanup *storage.DraftCleanupService, ticketStore *realtime.TicketStore, outboxDispatcher *outbox.Dispatcher) *gin.Engine {
 	// Set Gin mode based on logging configuration
 	if cfg.Logging.Development || strings.ToLower(cfg.Logging.Level) == "debug" {
 		gin.SetMode(gin.DebugMode)
@@ -319,7 +328,8 @@ func newServer(lc fx.Lifecycle, cfg *config.Config, db *gorm.DB, notifier *notif
 				}
 			}
 			notifier.Start(context.Background())
-			eventProducer.Start(context.Background())
+		eventProducer.Start(context.Background())
+		go outboxDispatcher.Start(context.Background())
 			mfaCleanup.Start(context.Background())
 			authCleanup.Start(context.Background())
 			draftCleanup.Start(context.Background())

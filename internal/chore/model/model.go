@@ -110,6 +110,16 @@ type ChoreHistory struct {
 	Points      *int               `json:"points,omitempty" gorm:"column:points"`                       // Points for completing the chore
 	Duration    *int               `json:"duration,omitempty" gorm:"<-:false;-:migration"`              // Duration in seconds calculated from query (read-only, no DB column)
 	SyncVersion int64              `json:"syncVersion" gorm:"column:sync_version;not null;default:0;index:idx_chore_history_sync_version"`
+
+	// Generation lock: a pending-approval history row is one immutable completion
+	// generation. These fields are frozen when the completion is submitted, so an
+	// approval (including a retried or delayed one) settles exactly the same result.
+	LockedChoreVersion   int64      `json:"lockedChoreVersion" gorm:"column:locked_chore_version;not null;default:0"` // chore sync_version the member completed against
+	LockedNextDueDate    *time.Time `json:"lockedNextDueDate,omitempty" gorm:"column:locked_next_due_date"`           // next due date computed at submission
+	LockedNextAssignedTo *int       `json:"lockedNextAssignedTo,omitempty" gorm:"column:locked_next_assigned_to"`     // next executor chosen at submission
+	LockedPoints         *int       `json:"lockedPoints,omitempty" gorm:"column:locked_points"`                       // points approval will grant
+	DecidedBy            *int       `json:"decidedBy,omitempty" gorm:"column:decided_by"`                             // admin who approved or rejected this generation
+	DecidedAt            *time.Time `json:"decidedAt,omitempty" gorm:"column:decided_at"`                             // when the generation was consumed
 }
 
 type ChoreHistoryStatus int8

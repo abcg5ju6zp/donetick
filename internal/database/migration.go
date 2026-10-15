@@ -17,6 +17,7 @@ import (
 	filterModel "donetick.com/core/internal/filter/model"
 	lModel "donetick.com/core/internal/label/model"
 	nModel "donetick.com/core/internal/notifier/model"
+	"donetick.com/core/internal/outbox"
 	pModel "donetick.com/core/internal/points"
 	projModel "donetick.com/core/internal/project/model"
 	rwModel "donetick.com/core/internal/reward/model"
@@ -71,6 +72,7 @@ func Migration(db *gorm.DB) error {
 		rwModel.RewardRedemption{},
 		bridgeModel.Settings{},
 		calModel.CalendarToken{},
+		outbox.Event{},
 	); err != nil {
 		return err
 	}

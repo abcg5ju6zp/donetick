@@ -28,6 +28,7 @@ import (
 	nps "donetick.com/core/internal/notifier/service"
 	fcmService "donetick.com/core/internal/notifier/service/fcm"
 	"donetick.com/core/internal/realtime"
+	"donetick.com/core/internal/outbox"
 	storage "donetick.com/core/internal/storage"
 	storageModel "donetick.com/core/internal/storage/model"
 	storageRepo "donetick.com/core/internal/storage/repo"
@@ -44,21 +45,23 @@ import (
 )
 
 type Handler struct {
-	choreRepo       *chRepo.ChoreRepository
-	circleRepo      *cRepo.CircleRepository
-	notifier        *notifier.Notifier
-	nPlanner        *nps.NotificationPlanner
-	nRepo           *nRepo.NotificationRepository
-	tRepo           *tRepo.ThingRepository
-	lRepo           *lRepo.LabelRepository
-	uRepo           *uRepo.UserRepository
-	deviceRepo      *dRepo.DeviceRepository
-	eventProducer   *events.EventsProducer
-	stRepo          *stRepo.SubTasksRepository
-	storageRepo     *storageRepo.StorageRepository
-	storage         storage.Storage
-	realTimeService *realtime.RealTimeService
-	signer          storage.URLSigner
+	choreRepo        *chRepo.ChoreRepository
+	circleRepo       *cRepo.CircleRepository
+	notifier         *notifier.Notifier
+	nPlanner         *nps.NotificationPlanner
+	nRepo            *nRepo.NotificationRepository
+	tRepo            *tRepo.ThingRepository
+	lRepo            *lRepo.LabelRepository
+	uRepo            *uRepo.UserRepository
+	deviceRepo       *dRepo.DeviceRepository
+	eventProducer    *events.EventsProducer
+	stRepo           *stRepo.SubTasksRepository
+	storageRepo      *storageRepo.StorageRepository
+	storage          storage.Storage
+	realTimeService  *realtime.RealTimeService
+	signer           storage.URLSigner
+	outboxRepo       *outbox.Repository
+	outboxDispatcher *outbox.Dispatcher
 }
 
 func NewHandler(cr *chRepo.ChoreRepository, circleRepo *cRepo.CircleRepository, nt *notifier.Notifier,
@@ -69,23 +72,27 @@ func NewHandler(cr *chRepo.ChoreRepository, circleRepo *cRepo.CircleRepository, 
 	dr *dRepo.DeviceRepository,
 	stoRepo *storageRepo.StorageRepository,
 	signer storage.URLSigner,
-	rts *realtime.RealTimeService) *Handler {
+	rts *realtime.RealTimeService,
+	outboxRepo *outbox.Repository,
+	outboxDispatcher *outbox.Dispatcher) *Handler {
 	return &Handler{
-		choreRepo:       cr,
-		uRepo:           ur,
-		deviceRepo:      dr,
-		circleRepo:      circleRepo,
-		notifier:        nt,
-		nPlanner:        np,
-		nRepo:           nRepo,
-		tRepo:           tRepo,
-		lRepo:           lRepo,
-		eventProducer:   ep,
-		stRepo:          stRepo,
-		storageRepo:     stoRepo,
-		storage:         stor,
-		signer:          signer,
-		realTimeService: rts,
+		choreRepo:        cr,
+		uRepo:            ur,
+		deviceRepo:       dr,
+		circleRepo:       circleRepo,
+		notifier:         nt,
+		nPlanner:         np,
+		nRepo:            nRepo,
+		tRepo:            tRepo,
+		lRepo:            lRepo,
+		eventProducer:    ep,
+		stRepo:           stRepo,
+		storageRepo:      stoRepo,
+		storage:          stor,
+		signer:           signer,
+		realTimeService:  rts,
+		outboxRepo:       outboxRepo,
+		outboxDispatcher: outboxDispatcher,
 	}
 }
 
@@ -2281,10 +2288,38 @@ func (h *Handler) CompleteChore(c *gin.Context) {
 		note = req.Note
 	}
 
+	// The next executor is computed before the approval branch so the pending
+	// generation can lock it together with the next due date.
+	nextAssignedTo, err := checkNextAssignee(chore, choreHistory, completedBy, circleUsers)
+	if err != nil {
+		logging.FromContext(c).Error("Failed to check next assignee", "error", err)
+		c.JSON(500, gin.H{
+			"error": "Error checking next assignee",
+		})
+		return
+	}
+
 	// Check if chore requires approval
 	if chore.RequireApproval {
-		// Set chore status to pending approval instead of completing
-		if err := h.choreRepo.SetChorePendingApproval(c, chore, note, completedBy, &completedDate); err != nil {
+		// Record the pending completion generation. The settlement plan (chore
+		// version, completer, completion time, next executor, due date, points)
+		// is frozen on the history row now.
+		generation, err := h.choreRepo.SetChorePendingApproval(c, chRepo.PendingApprovalInput{
+			Chore:          chore,
+			Note:           note,
+			UserID:         completedBy,
+			CompletedDate:  &completedDate,
+			NextDueDate:    nextDueDate,
+			NextAssignedTo: nextAssignedTo,
+			ApplyPoints:    true,
+		})
+		if err != nil {
+			if errors.Is(err, chRepo.ErrChoreAlreadyPending) {
+				c.JSON(http.StatusConflict, gin.H{
+					"error": "Chore is already pending approval",
+				})
+				return
+			}
 			c.JSON(500, gin.H{
 				"error": "Error setting chore pending approval",
 			})
@@ -2314,20 +2349,12 @@ func (h *Handler) CompleteChore(c *gin.Context) {
 		if completerName == "" {
 			completerName = effectiveUser.Username
 		}
-		h.notifyAdminsOfPendingApproval(c, actualUser.CircleID, completerName, updatedChore)
+		h.notifyAdminsOfPendingApproval(c, actualUser.CircleID, completerName, updatedChore, &effectiveUser.User, circleUsers)
 
 		c.JSON(200, gin.H{
-			"res":     updatedChore,
-			"message": "Chore completion submitted for approval",
-		})
-		return
-	}
-
-	nextAssignedTo, err := checkNextAssignee(chore, choreHistory, completedBy, circleUsers)
-	if err != nil {
-		logging.FromContext(c).Error("Failed to check next assignee", "error", err)
-		c.JSON(500, gin.H{
-			"error": "Error checking next assignee",
+			"res":          updatedChore,
+			"generationId": generation.ID,
+			"message":      "Chore completion submitted for approval",
 		})
 		return
 	}
@@ -3370,27 +3397,49 @@ func (h *Handler) DeleteTimeSession(c *gin.Context) {
 	}
 }
 
-// notifyAdminsOfPendingApproval fans out one Notification row per admin/manager's
-// registered delivery target when a completion is submitted for approval —
-// same shape used by reward.notifyAdminsOfRedemptionRequest for redemption
-// requests, and the same notifiableMembers filtering chore reminders already
-// apply (active member, has a configured platform + target). See issue #456.
-func (h *Handler) notifyAdminsOfPendingApproval(c *gin.Context, circleID int, completerName string, chore *chModel.Chore) {
-	circleUsers, err := h.circleRepo.GetCircleUsers(c, circleID)
-	if err != nil {
-		logging.FromContext(c).Error("Failed to fetch circle users for approval notification", "error", err)
+// pendingApprovalRecipients returns the active admins and managers who are
+// allowed to see the chore and can therefore approve it. A restricted project
+// is the outer boundary, like every other chore notification; standalone
+// private chores stay with their creator/assignees.
+func pendingApprovalRecipients(chore *chModel.Chore, submitter *uModel.User, circleUsers []*circle.UserCircleDetail) []int {
+	_ = submitter // the completer does not widen or narrow the approver audience
+	recipients := make([]int, 0)
+	for _, member := range circleUsers {
+		if !(member.Role == circle.UserRoleAdmin || member.Role == circle.UserRoleManager) {
+			continue
+		}
+		if !member.IsActive {
+			continue
+		}
+		if !chore.CanView(member.UserID, circleUsers) {
+			continue
+		}
+		recipients = append(recipients, member.UserID)
+	}
+	return recipients
+}
+
+// notifyAdminsOfPendingApproval fans out one Notification row per eligible
+// admin/manager's registered delivery target. The rows are persisted before the
+// request returns and retried by the notification scheduler, so a failed
+// delivery never re-runs settlement.
+func (h *Handler) notifyAdminsOfPendingApproval(c *gin.Context, circleID int, completerName string, chore *chModel.Chore, submitter *uModel.User, circleUsers []*circle.UserCircleDetail) {
+	recipientIDs := pendingApprovalRecipients(chore, submitter, circleUsers)
+	if len(recipientIDs) == 0 {
 		return
+	}
+	membersByID := make(map[int]*circle.UserCircleDetail, len(circleUsers))
+	for _, member := range circleUsers {
+		membersByID[member.UserID] = member
 	}
 
 	text := fmt.Sprintf("%s marked \"%s\" done — needs your approval", completerName, chore.Name)
 	now := time.Now().UTC()
 
 	var notifications []*nModel.Notification
-	for _, member := range circleUsers {
-		if !(member.Role == circle.UserRoleAdmin || member.Role == circle.UserRoleManager) {
-			continue
-		}
-		if !member.IsActive || member.NotificationType == nModel.NotificationPlatformNone || member.TargetID == "" {
+	for _, userID := range recipientIDs {
+		member := membersByID[userID]
+		if member == nil || member.NotificationType == nModel.NotificationPlatformNone || member.TargetID == "" {
 			continue
 		}
 		notifications = append(notifications, &nModel.Notification{
@@ -3440,7 +3489,7 @@ func (h *Handler) ApproveChore(c *gin.Context) {
 		return
 	}
 
-	var req ActionReq
+	var req ApproveChoreReq
 	if err := bindOptionalActionReq(c, &req); err != nil {
 		c.JSON(400, gin.H{
 			"error": "Invalid request body",
@@ -3466,8 +3515,14 @@ func (h *Handler) ApproveChore(c *gin.Context) {
 		})
 		return
 	}
-	if !validateActionVersion(c, "approve", chore, req.ActionOptions) {
-		return
+	// While the generation is open the optimistic version check still guards
+	// concurrent edits. Once it is decided, a retried (possibly delayed)
+	// request must fall through to the deterministic replay instead of failing
+	// the version bump the first approval produced.
+	if chore.Status == chModel.ChoreStatusPendingApproval {
+		if !validateActionVersion(c, "approve", chore, req.ActionOptions) {
+			return
+		}
 	}
 
 	// Check if user is admin in the circle
@@ -3495,81 +3550,29 @@ func (h *Handler) ApproveChore(c *gin.Context) {
 		return
 	}
 
-	// Check if chore is pending approval
-	if chore.Status != chModel.ChoreStatusPendingApproval {
-		c.JSON(400, gin.H{
-			"error": "Chore is not pending approval",
-		})
-		return
-	}
-
-	// Get the pending approval history to determine who completed it
-	allHistory, err := h.choreRepo.GetChoreHistory(c, chore.ID)
+	// Settle the generation. Points, recurrence, subtask reset and Thing
+	// actions share this one conditional consume; external deliveries are
+	// enqueued in the same transaction, so nothing is announced unless the
+	// settlement commits.
+	outcome, err := h.choreRepo.ApproveChore(c, chRepo.ApproveInput{
+		Chore:        chore,
+		GenerationID: req.HistoryID,
+		AdminUserID:  currentUser.ID,
+		ApplyPoints:  true,
+		OnSettled: func(tx *gorm.DB, settled *chRepo.ApprovalOutcome) error {
+			return h.enqueueCompletionDeliveries(tx, chore, currentUser, settled.History.ID, settled, nil)
+		},
+	})
 	if err != nil {
-		logging.FromContext(c).Errorw("Failed to fetch chore history for approval process", "error", err, "choreID", chore.ID)
-		c.JSON(500, gin.H{
-			"error": "Failed to fetch chore history for approval process",
-		})
-		return
-	}
-
-	// Find the most recent pending approval entry
-	var pendingHistory *chModel.ChoreHistory
-	for _, h := range allHistory {
-		if h.Status == chModel.ChoreHistoryStatusPendingApproval {
-			pendingHistory = h
-			break
+		if h.respondGenerationDecision(c, err, id, currentUser, true) {
+			return
 		}
-	}
-
-	if pendingHistory == nil {
-		c.JSON(500, gin.H{
-			"error": "No pending approval history found",
-		})
-		return
-	}
-
-	completedBy := pendingHistory.CompletedBy
-	completedDate := *pendingHistory.PerformedAt
-
-	// Calculate next due date and assignee like in normal completion
-	var nextDueDate *time.Time
-	if chore.FrequencyType == "adaptive" {
-		allHistory, err := h.choreRepo.GetChoreHistoryWithLimit(c, chore.ID, 5)
-		if err != nil {
-			logging.FromContext(c).Errorw("Failed to fetch chore history for adaptive scheduling during approval", "error", err, "choreID", chore.ID)
-			c.JSON(500, gin.H{
-				"error": "Failed to fetch chore history for adaptive scheduling",
+		if errors.Is(err, chRepo.ErrGenerationNotFound) {
+			c.JSON(400, gin.H{
+				"error": "No pending approval history found",
 			})
 			return
 		}
-		nextDueDate, err = scheduleAdaptiveNextDueDate(chore, completedDate, allHistory)
-		if err != nil {
-			c.JSON(500, gin.H{
-				"error": "Error scheduling next due date",
-			})
-			return
-		}
-	} else {
-		nextDueDate, err = scheduleNextDueDate(c, chore, completedDate.UTC())
-		if err != nil {
-			c.JSON(500, gin.H{
-				"error": "Error scheduling next due date",
-			})
-			return
-		}
-	}
-
-	nextAssignedTo, err := checkNextAssignee(chore, allHistory, completedBy, circleUsers)
-	if err != nil {
-		c.JSON(500, gin.H{
-			"error": "Error checking next assignee",
-		})
-		return
-	}
-
-	// Approve the chore
-	if err := h.choreRepo.ApproveChore(c, chore, currentUser.ID, nextDueDate, nextAssignedTo, true); err != nil {
 		c.JSON(500, gin.H{
 			"error": "Error approving chore",
 		})
@@ -3585,31 +3588,115 @@ func (h *Handler) ApproveChore(c *gin.Context) {
 		return
 	}
 
-	if updatedChore.SubTasks != nil && updatedChore.FrequencyType != chModel.FrequencyTypeOnce {
-		h.stRepo.ResetSubtasksCompletion(c, updatedChore.ID)
-	}
-
 	h.nPlanner.GenerateNotifications(c, updatedChore)
-	h.eventProducer.ChoreCompleted(c, currentUser.WebhookURL, chore, &currentUser.User)
-
-	// Broadcast real-time chore approved event
-	if h.realTimeService != nil {
-		broadcaster := h.realTimeService.GetEventBroadcaster()
-		broadcaster.BroadcastChoreCompleted(updatedChore, &currentUser.User, pendingHistory, nil)
-	}
+	// Deliveries live in the durable outbox; kick the dispatcher for near-immediate send.
+	h.outboxDispatcher.Kick()
 
 	c.JSON(200, gin.H{
-		"res":     updatedChore,
-		"message": "Chore approved successfully",
+		"res":          updatedChore,
+		"generationId": outcome.History.ID,
+		"message":      "Chore approved successfully",
 	})
 }
 
+// enqueueCompletionDeliveries writes the realtime broadcast and circle webhook
+// deliveries inside the settlement transaction. It runs only for the call that
+// actually consumes the generation, so a duplicate approval can never enqueue
+// a duplicate delivery.
+func (h *Handler) enqueueCompletionDeliveries(tx *gorm.DB, pre *chModel.Chore, actor *uModel.UserDetails, generationID int, outcome *chRepo.ApprovalOutcome, note *string) error {
+	if h.outboxRepo == nil {
+		return nil
+	}
+	pending := []*outbox.Event{{
+		CircleID:  pre.CircleID,
+		ChoreID:   pre.ID,
+		HistoryID: &generationID,
+		Kind:      outbox.KindRealtime,
+		EventType: "chore.completed",
+		Payload:   outbox.Payload{PerformerID: actor.ID, Note: note},
+	}}
+
+	snapshot := settlementChoreSnapshot(pre, outcome)
+	if actor.WebhookURL != nil && *actor.WebhookURL != "" && !events.ChoreHiddenFromCircle(snapshot) {
+		displayName := actor.DisplayName
+		pending = append(pending, &outbox.Event{
+			CircleID:  pre.CircleID,
+			ChoreID:   pre.ID,
+			HistoryID: &generationID,
+			Kind:      outbox.KindWebhook,
+			EventType: string(events.EventTypeTaskCompleted),
+			Target:    *actor.WebhookURL,
+			Payload: outbox.Payload{
+				Chore:       snapshot,
+				Username:    actor.Username,
+				DisplayName: displayName,
+				Note:        note,
+			},
+		})
+	}
+	return h.outboxRepo.Enqueue(tx, pending...)
+}
+
+// settlementChoreSnapshot returns the preloaded chore with the scalar fields
+// the settlement just wrote, so webhook retries always announce the settled
+// state even if the chore changes later.
+func settlementChoreSnapshot(pre *chModel.Chore, outcome *chRepo.ApprovalOutcome) *chModel.Chore {
+	snapshot := *pre
+	if outcome != nil && outcome.Chore != nil {
+		snapshot.Status = outcome.Chore.Status
+		snapshot.NextDueDate = outcome.Chore.NextDueDate
+		snapshot.AssignedTo = outcome.Chore.AssignedTo
+		snapshot.IsActive = outcome.Chore.IsActive
+		snapshot.SyncVersion = outcome.Chore.SyncVersion
+	}
+	return &snapshot
+}
+
+// respondGenerationDecision maps an already-consumed generation onto the
+// deterministic HTTP result. A replay of the same decision is reported as a
+// successful 200 (the caller retried after a lost response), while the
+// conflicting decision is reported as 409. Neither path performs any side
+// effect. It returns false when err is not a decided-generation error.
+func (h *Handler) respondGenerationDecision(c *gin.Context, err error, choreID int, currentUser *uModel.UserDetails, approving bool) bool {
+	var decided *chRepo.GenerationAlreadyDecided
+	if !errors.As(err, &decided) {
+		return false
+	}
+	updatedChore, loadErr := h.choreRepo.GetChore(c, choreID, currentUser.ID, currentUser.CircleID)
+	if loadErr != nil {
+		c.JSON(500, gin.H{"error": "Failed to retrieve chore"})
+		return true
+	}
+	switch {
+	case approving && decided.Status == chModel.ChoreHistoryStatusCompleted:
+		c.JSON(200, gin.H{"res": updatedChore, "message": "Chore was already approved"})
+	case approving && decided.Status == chModel.ChoreHistoryStatusRejected:
+		c.JSON(http.StatusConflict, gin.H{"error": "That completion was rejected and cannot be approved; a new completion is required"})
+	case !approving && decided.Status == chModel.ChoreHistoryStatusRejected:
+		c.JSON(200, gin.H{"res": updatedChore, "message": "Chore was already rejected"})
+	case !approving && decided.Status == chModel.ChoreHistoryStatusCompleted:
+		c.JSON(http.StatusConflict, gin.H{"error": "That completion was already approved and cannot be rejected"})
+	default:
+		c.JSON(http.StatusConflict, gin.H{"error": "The pending completion was already decided"})
+	}
+	return true
+}
+
 // region: request models
+
+type ApproveChoreReq struct {
+	ActionOptions *ActionOptions `json:"actionOptions"`
+	// HistoryID optionally identifies the exact completion generation. When
+	// omitted the currently open generation is used; an explicit id keeps a
+	// delayed decision from settling a newer generation.
+	HistoryID *int `json:"historyId"`
+}
 
 type RejectChoreReq struct { // TODO: Remove "Note" in future.
 	Notes         *string        `json:"notes" binding:"omitempty,min=1"`
 	Note          *string        `json:"note" binding:"omitempty,min=1"` // This is going to be deprecated in future release, use "Notes" instead.
 	ActionOptions *ActionOptions `json:"actionOptions"`
+	HistoryID     *int           `json:"historyId"`
 }
 
 // endregion
@@ -3655,11 +3742,14 @@ func (h *Handler) RejectChore(c *gin.Context) {
 	}
 
 	var req RejectChoreReq
-	if err := c.ShouldBindJSON(&req); err != nil {
-		c.JSON(400, gin.H{
-			"error": "Invalid request body",
-		})
-		return
+	// Reject accepts an empty body, so binding failures on EOF are tolerated.
+	if c.Request.ContentLength != 0 {
+		if err := c.ShouldBindJSON(&req); err != nil {
+			c.JSON(400, gin.H{
+				"error": "Invalid request body",
+			})
+			return
+		}
 	}
 	// Get the chore
 	chore, err := h.choreRepo.GetChore(c, id, currentUser.ID, currentUser.CircleID)
@@ -3670,8 +3760,12 @@ func (h *Handler) RejectChore(c *gin.Context) {
 		})
 		return
 	}
-	if !validateActionVersion(c, "reject", chore, req.ActionOptions) {
-		return
+	// See ApproveChore: skip the version check once decided so a retried
+	// rejection reaches the deterministic replay.
+	if chore.Status == chModel.ChoreStatusPendingApproval {
+		if !validateActionVersion(c, "reject", chore, req.ActionOptions) {
+			return
+		}
 	}
 
 	// Check if user is admin in the circle
@@ -3699,17 +3793,7 @@ func (h *Handler) RejectChore(c *gin.Context) {
 		return
 	}
 
-	// Check if chore is pending approval
-	if chore.Status != chModel.ChoreStatusPendingApproval {
-		c.JSON(400, gin.H{
-			"error": "Chore is not pending approval",
-		})
-		return
-	}
-
-	// Reject the chore
 	var note *string
-
 	if req.Notes != nil {
 		note = req.Notes
 	}
@@ -3717,9 +3801,25 @@ func (h *Handler) RejectChore(c *gin.Context) {
 		note = req.Note
 	}
 
-	// Reject the chore
-	if err := h.choreRepo.RejectChore(c, id, currentUser.CircleID, note); err != nil {
-
+	// Consume the generation as rejected. No points, recurrence, subtask or
+	// Thing effect runs, and a duplicate rejection settles nothing.
+	generation, err := h.choreRepo.RejectChore(c, chRepo.RejectInput{
+		ChoreID:       id,
+		CircleID:      currentUser.CircleID,
+		GenerationID:  req.HistoryID,
+		AdminUserID:   currentUser.ID,
+		RejectionNote: note,
+	})
+	if err != nil {
+		if h.respondGenerationDecision(c, err, id, currentUser, false) {
+			return
+		}
+		if errors.Is(err, chRepo.ErrGenerationNotFound) {
+			c.JSON(400, gin.H{
+				"error": "No pending approval history found",
+			})
+			return
+		}
 		c.JSON(500, gin.H{
 			"error": "Error rejecting chore",
 		})
@@ -3747,8 +3847,9 @@ func (h *Handler) RejectChore(c *gin.Context) {
 	}
 
 	c.JSON(200, gin.H{
-		"res":     updatedChore,
-		"message": "Chore rejected successfully",
+		"res":          updatedChore,
+		"generationId": generation.ID,
+		"message":      "Chore rejected successfully",
 	})
 }
 
