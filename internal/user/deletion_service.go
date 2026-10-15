@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"log"
 	"strings"
+	"sync"
 
 	"donetick.com/core/internal/storage"
 	uModel "donetick.com/core/internal/user/model"
@@ -14,6 +15,15 @@ import (
 type DeletionService struct {
 	db      *gorm.DB
 	storage storage.Storage
+
+	// locks serializes deletion attempts for the same user inside this
+	// process (duplicate requests, lost responses). Cross-process races are
+	// closed by the deleting_at CAS and idempotent stages.
+	locks sync.Map // userID(int) -> *sync.Mutex
+
+	// reaperStop, once set by Start, keeps the background recovery loop
+	// running until Stop closes it.
+	reaperStop chan struct{}
 }
 
 func NewDeletionService(db *gorm.DB, storage storage.Storage) *DeletionService {
@@ -30,6 +40,10 @@ type DeletionResult struct {
 	CirclesLeft      []CircleTransferInfo   `json:"circlesLeft,omitempty"`
 	RequiresTransfer bool                   `json:"requiresTransfer"`
 	TransferOptions  []CircleTransferOption `json:"transferOptions,omitempty"`
+	// StorageCleanupPending is true when the database deletion committed but
+	// some external objects could not be retired yet; a durable record tracks
+	// them for background/retry cleanup.
+	StorageCleanupPending bool `json:"storageCleanupPending,omitempty"`
 }
 
 type CircleTransferInfo struct {
@@ -93,39 +107,12 @@ func (s *DeletionService) deleteUserAccount(ctx context.Context, userID int, tra
 
 	// For dry run, return what would be deleted without actually deleting
 	if dryRun {
-		// Count what would be deleted
+		// Count records that would be deleted
 		result.Message = "Preview of what would be deleted"
 		result.Success = true
 
-		// Count records that would be deleted
-		deletionSteps := []struct {
-			name     string
-			function func(*gorm.DB, int) (int, error)
-		}{
-			{"mfa_sessions", s.countMFASessions},
-			{"api_tokens", s.countAPITokens},
-			{"password_reset_tokens", s.countPasswordResetTokens},
-			{"user_notification_targets", s.countNotificationTargets},
-			{"notifications", s.countNotifications},
-			{"time_sessions", s.countTimeSessions},
-			{"chore_history", s.countChoreHistory},
-			{"chore_assignees", s.countChoreAssignees},
-			{"project_members", s.countProjectMemberships},
-			{"projects", s.countOwnedProjects},
-			{"tombstones", s.countUserTombstones},
-			{"chore_labels", s.countChoreLabels},
-			{"subtasks", s.countUserSubtasks},
-			{"chores", s.countUserChores},
-			{"points_history", s.countPointsHistory},
-			{"storage_files", s.countStorageFiles},
-			{"storage_usage", s.countStorageUsage},
-			{"user_circles", s.countUserCircles},
-			{"labels", s.countUserLabels},
-			{"things", s.countUserThings},
-		}
-
-		for _, step := range deletionSteps {
-			count, err := step.function(tx, userID)
+		for _, step := range s.allDeletionSteps() {
+			count, err := step.count(tx, userID)
 			if err != nil {
 				return nil, fmt.Errorf("failed to count %s: %w", step.name, err)
 			}
@@ -177,34 +164,8 @@ func (s *DeletionService) deleteUserAccount(ctx context.Context, userID int, tra
 	}
 
 	// Delete user-related data in order (respecting foreign key constraints)
-	deletionSteps := []struct {
-		name     string
-		function func(*gorm.DB, int) (int, error)
-	}{
-		{"mfa_sessions", s.deleteMFASessions},
-		{"api_tokens", s.deleteAPITokens},
-		{"password_reset_tokens", s.deletePasswordResetTokens},
-		{"user_notification_targets", s.deleteNotificationTargets},
-		{"notifications", s.deleteNotifications},
-		{"time_sessions", s.deleteTimeSessions},
-		{"chore_history", s.deleteChoreHistory},
-		{"chore_assignees", s.deleteChoreAssignees},
-		{"project_members", s.deleteProjectMemberships},
-		{"projects", s.deleteOwnedProjects},
-		{"tombstones", s.deleteUserTombstones},
-		{"chore_labels", s.deleteChoreLabels},
-		{"subtasks", s.deleteUserSubtasks},
-		{"chores", s.deleteUserChores},
-		{"points_history", s.deletePointsHistory},
-		{"storage_files", s.deleteStorageFiles},
-		{"storage_usage", s.deleteStorageUsage},
-		{"user_circles", s.deleteUserCircles},
-		{"labels", s.deleteUserLabels},
-		{"things", s.deleteUserThings},
-	}
-
-	for _, step := range deletionSteps {
-		count, err := step.function(tx, userID)
+	for _, step := range s.allDeletionSteps() {
+		count, err := step.run(tx, userID)
 		if err != nil {
 			return nil, fmt.Errorf("failed to delete %s: %w", step.name, err)
 		}
@@ -235,6 +196,43 @@ func (s *DeletionService) deleteUserAccount(ctx context.Context, userID int, tra
 	result.Success = true
 	result.Message = "Account deleted successfully"
 	return result, nil
+}
+
+// deletionStep is one ordered database cleanup step. Both the legacy
+// transactional deletion and the resumable staged deletion run the same list,
+// so impact preview and actual deletion never drift.
+type deletionStep struct {
+	name  string
+	run   func(*gorm.DB, int) (int, error)
+	count func(*gorm.DB, int) (int, error)
+}
+
+// allDeletionSteps lists the user-owned rows removed during account deletion,
+// in foreign-key-safe order. Circle ownership transfer and child accounts are
+// handled separately.
+func (s *DeletionService) allDeletionSteps() []deletionStep {
+	return []deletionStep{
+		{"mfa_sessions", s.deleteMFASessions, s.countMFASessions},
+		{"api_tokens", s.deleteAPITokens, s.countAPITokens},
+		{"password_reset_tokens", s.deletePasswordResetTokens, s.countPasswordResetTokens},
+		{"user_notification_targets", s.deleteNotificationTargets, s.countNotificationTargets},
+		{"notifications", s.deleteNotifications, s.countNotifications},
+		{"time_sessions", s.deleteTimeSessions, s.countTimeSessions},
+		{"chore_history", s.deleteChoreHistory, s.countChoreHistory},
+		{"chore_assignees", s.deleteChoreAssignees, s.countChoreAssignees},
+		{"project_members", s.deleteProjectMemberships, s.countProjectMemberships},
+		{"projects", s.deleteOwnedProjects, s.countOwnedProjects},
+		{"tombstones", s.deleteUserTombstones, s.countUserTombstones},
+		{"chore_labels", s.deleteChoreLabels, s.countChoreLabels},
+		{"subtasks", s.deleteUserSubtasks, s.countUserSubtasks},
+		{"chores", s.deleteUserChores, s.countUserChores},
+		{"points_history", s.deletePointsHistory, s.countPointsHistory},
+		{"storage_files", s.deleteStorageFiles, s.countStorageFiles},
+		{"storage_usage", s.deleteStorageUsage, s.countStorageUsage},
+		{"user_circles", s.deleteUserCircles, s.countUserCircles},
+		{"labels", s.deleteUserLabels, s.countUserLabels},
+		{"things", s.deleteUserThings, s.countUserThings},
+	}
 }
 
 func (s *DeletionService) getChildUsers(tx *gorm.DB, userID int) ([]int, error) {

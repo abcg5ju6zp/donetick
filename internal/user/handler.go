@@ -1440,8 +1440,9 @@ func (h *Handler) deleteAccount(c *gin.Context) {
 		return
 	}
 
-	// Perform account deletion
-	result, err := h.deletionService.DeleteUserAccount(c.Request.Context(), currentUser.ID, req.TransferOptions)
+	// Perform account deletion. Accounts with attachments go through the
+	// resumable staged flow; all other cases use the legacy transactional path.
+	result, err := h.deletionService.DeleteOwnAccount(c.Request.Context(), currentUser.ID, req.TransferOptions)
 	if err != nil {
 		logging.DefaultLogger().Errorf("Failed to delete account for user %d: %v", currentUser.ID, err)
 		c.JSON(http.StatusInternalServerError, gin.H{"error": "Failed to delete account: " + err.Error()})

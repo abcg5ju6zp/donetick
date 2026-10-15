@@ -63,6 +63,12 @@ func NewAuthMiddleware(cfg *config.Config, userRepo *uRepo.UserRepository, mfaSe
 			if err != nil {
 				return nil
 			}
+			// Deletion fence: a token issued before deletion started must not
+			// authenticate (and therefore cannot create data) once deletion
+			// begins.
+			if user.DeletingAt != nil {
+				return nil
+			}
 			return user
 		},
 		Authenticator: func(c *gin.Context) (interface{}, error) {
@@ -76,7 +82,7 @@ func NewAuthMiddleware(cfg *config.Config, userRepo *uRepo.UserRepository, mfaSe
 
 				// ctx := cache.WithCacheSkip(c.Request.Context(), true)
 				user, err := userRepo.GetUserByUsername(c.Request.Context(), req.Username)
-				if err != nil || user.Disabled {
+				if err != nil || user.Disabled || user.DeletingAt != nil {
 					return nil, jwt.ErrFailedAuthentication
 				}
 				err = Matches(user.Password, req.Password)

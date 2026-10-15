@@ -11,6 +11,7 @@ import (
 
 	"donetick.com/core/config"
 	"github.com/aws/aws-sdk-go/aws"
+	"github.com/aws/aws-sdk-go/aws/awserr"
 	"github.com/aws/aws-sdk-go/aws/credentials"
 	"github.com/aws/aws-sdk-go/aws/session"
 	"github.com/aws/aws-sdk-go/service/s3"
@@ -82,6 +83,23 @@ func (s *S3Storage) Delete(ctx context.Context, paths []string) error {
 		})
 		if e != nil {
 			err = e
+		}
+	}
+	return err
+}
+
+// EnsureDeleted removes one object. S3 DeleteObject is idempotent (a missing
+// key still returns 204); an explicit NotFound response is treated as success
+// as well, so retirement can safely retry.
+func (s *S3Storage) EnsureDeleted(ctx context.Context, path string) error {
+	key := s.BasePath + path
+	_, err := s.Client.DeleteObjectWithContext(ctx, &s3.DeleteObjectInput{
+		Bucket: aws.String(s.Bucket),
+		Key:    aws.String(key),
+	})
+	if err != nil {
+		if aerr, ok := err.(awserr.Error); ok && aerr.Code() == s3.ErrCodeNoSuchKey {
+			return nil
 		}
 	}
 	return err

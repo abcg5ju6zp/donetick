@@ -260,7 +260,7 @@ func main() {
 
 }
 
-func newServer(lc fx.Lifecycle, cfg *config.Config, db *gorm.DB, notifier *notifier.Scheduler, eventProducer *events.EventsProducer, mfaCleanup *mfa.CleanupService, authCleanup *auth.CleanupService, rts *realtime.RealTimeService, draftCleanup *storage.DraftCleanupService, ticketStore *realtime.TicketStore) *gin.Engine {
+func newServer(lc fx.Lifecycle, cfg *config.Config, db *gorm.DB, notifier *notifier.Scheduler, eventProducer *events.EventsProducer, mfaCleanup *mfa.CleanupService, authCleanup *auth.CleanupService, rts *realtime.RealTimeService, draftCleanup *storage.DraftCleanupService, ticketStore *realtime.TicketStore, deletionService *user.DeletionService) *gin.Engine {
 	// Set Gin mode based on logging configuration
 	if cfg.Logging.Development || strings.ToLower(cfg.Logging.Level) == "debug" {
 		gin.SetMode(gin.DebugMode)
@@ -323,6 +323,9 @@ func newServer(lc fx.Lifecycle, cfg *config.Config, db *gorm.DB, notifier *notif
 			mfaCleanup.Start(context.Background())
 			authCleanup.Start(context.Background())
 			draftCleanup.Start(context.Background())
+			// Take over account deletions interrupted by a restart and sweep
+			// records waiting on object-storage retirement.
+			deletionService.Start(context.Background())
 
 			// Start real-time service
 			if err := rts.Start(ctx); err != nil {
@@ -355,6 +358,7 @@ func newServer(lc fx.Lifecycle, cfg *config.Config, db *gorm.DB, notifier *notif
 			mfaCleanup.Stop()
 			authCleanup.Stop()
 			draftCleanup.Stop()
+			deletionService.Stop()
 
 			// Stop the SSE ticket store cleanup goroutine
 			ticketStore.Stop()

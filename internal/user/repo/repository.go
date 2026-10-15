@@ -50,6 +50,10 @@ type IUserRepository interface {
 	RevokeSessionFamily(c context.Context, familyID string) error
 	RevokeAllUserSessions(c context.Context, userID int) error
 	CleanupExpiredSessions(c context.Context) error
+	// IsAccountBeingDeleted reports whether the account is inside the
+	// deletion fence (deleting_at set). Authentication paths must reject such
+	// accounts even if a previously issued credential is still valid.
+	IsAccountBeingDeleted(c context.Context, userID int) (bool, error)
 }
 
 type UserRepository struct {
@@ -423,4 +427,16 @@ func (r *UserRepository) RevokeAllUserSessions(c context.Context, userID int) er
 func (r *UserRepository) CleanupExpiredSessions(c context.Context) error {
 	now := time.Now().UTC()
 	return r.db.WithContext(c).Where("expires_at < ? OR revoked_at IS NOT NULL", now).Delete(&uModel.UserSession{}).Error
+}
+
+// IsAccountBeingDeleted returns true while the account-deletion fence
+// (deleting_at) is raised for this user.
+func (r *UserRepository) IsAccountBeingDeleted(c context.Context, userID int) (bool, error) {
+	var count int64
+	if err := r.db.WithContext(c).Model(&uModel.User{}).
+		Where("id = ? AND deleting_at IS NOT NULL", userID).
+		Count(&count).Error; err != nil {
+		return false, err
+	}
+	return count > 0, nil
 }

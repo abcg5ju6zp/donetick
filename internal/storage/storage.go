@@ -11,6 +11,10 @@ type Storage interface {
 	// if no public bucket is configured).
 	SavePublic(ctx context.Context, path string, file io.Reader) error
 	Delete(ctx context.Context, paths []string) error
+	// EnsureDeleted removes a single object and treats "object does not exist"
+	// as success, so callers can safely retry deletions after crashes or
+	// partial failures. Every other backend error is returned.
+	EnsureDeleted(ctx context.Context, path string) error
 	GetURL(ctx context.Context, path string) (string, error)
 	// GetPublicURL returns a bare, unsigned URL for objects saved via SavePublic.
 	// Falls back to a presigned URL when no public CDN host is configured.

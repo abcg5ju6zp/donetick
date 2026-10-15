@@ -27,8 +27,8 @@ func APITokenMiddleware(userRepo *uRepo.UserRepository) gin.HandlerFunc {
 			return
 		}
 
-		if user.Disabled {
-			c.JSON(http.StatusUnauthorized, gin.H{"error": "User account is disabled"})
+		if user.Disabled || user.DeletingAt != nil {
+			c.JSON(http.StatusUnauthorized, gin.H{"error": "User account is unavailable"})
 			c.Abort()
 			return
 		}

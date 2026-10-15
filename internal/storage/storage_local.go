@@ -63,12 +63,7 @@ func (l *LocalStorage) Get(ctx context.Context, path string) (io.ReadCloser, err
 func (l *LocalStorage) Delete(ctx context.Context, paths []string) error {
 	var errs []string
 	for _, path := range paths {
-		cleanPath, err := sanitizePath(path)
-		if err != nil {
-			errs = append(errs, err.Error())
-			continue
-		}
-		if err := os.Remove(filepath.Join(l.BasePath, cleanPath)); err != nil {
+		if err := l.removeOne(path); err != nil {
 			errs = append(errs, err.Error())
 		}
 	}
@@ -76,6 +71,24 @@ func (l *LocalStorage) Delete(ctx context.Context, paths []string) error {
 		return errors.New(strings.Join(errs, "; "))
 	}
 	return nil
+}
+
+// EnsureDeleted removes one object; an already-missing object is success so
+// account-deletion retirement can retry safely.
+func (l *LocalStorage) EnsureDeleted(ctx context.Context, path string) error {
+	err := l.removeOne(path)
+	if os.IsNotExist(err) {
+		return nil
+	}
+	return err
+}
+
+func (l *LocalStorage) removeOne(path string) error {
+	cleanPath, err := sanitizePath(path)
+	if err != nil {
+		return err
+	}
+	return os.Remove(filepath.Join(l.BasePath, cleanPath))
 }
 
 func (l *LocalStorage) GetURL(ctx context.Context, path string) (string, error) {

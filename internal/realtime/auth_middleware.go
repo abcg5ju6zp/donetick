@@ -61,6 +61,9 @@ func (am *AuthMiddleware) AuthenticateConnection(c *gin.Context) (*uModel.User, 
 			logger.Errorw("Failed to get user for SSE ticket", "userID", userID, "error", err)
 			return nil, 0, ErrInvalidToken
 		}
+		if user.DeletingAt != nil {
+			return nil, 0, ErrInvalidToken
+		}
 
 		return user, user.CircleID, nil
 	}
@@ -95,6 +98,9 @@ func (am *AuthMiddleware) AuthenticateConnection(c *gin.Context) (*uModel.User, 
 	user, err := am.userRepo.GetUserByID(c.Request.Context(), userID)
 	if err != nil {
 		logger.Errorw("Failed to get user", "userID", userID, "error", err)
+		return nil, 0, ErrInvalidToken
+	}
+	if user.DeletingAt != nil {
 		return nil, 0, ErrInvalidToken
 	}
 

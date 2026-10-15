@@ -100,6 +100,13 @@ func ImpersonationMiddleware(userRepo *uRepo.UserRepository, circleRepo *cRepo.C
 			WebhookURL: nil, // This will be populated from circle if needed
 		}
 
+		// A user inside the deletion fence must not be acted for.
+		if impersonatedUserDetails.DeletingAt != nil {
+			c.JSON(403, gin.H{"error": "Target account is unavailable"})
+			c.Abort()
+			return
+		}
+
 		// Clear the password for security
 		impersonatedUserDetails.Password = ""
 

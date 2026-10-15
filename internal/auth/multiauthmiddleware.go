@@ -96,8 +96,8 @@ func authenticateAPIKey(c *gin.Context, userRepo *uRepo.UserRepository) (bool, e
 		return false, errors.New("Unable to find user associated to API token.")
 	}
 
-	if user.Disabled {
-		return false, errors.New("User account is disabled")
+	if user.Disabled || user.DeletingAt != nil {
+		return false, errors.New("User account is unavailable")
 	}
 
 	// Set the user in context

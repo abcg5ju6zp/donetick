@@ -31,6 +31,12 @@ type User struct {
 	CreatedAt       time.Time `json:"created_at" gorm:"column:created_at"`                            // Created at
 	UpdatedAt       time.Time `json:"updated_at" gorm:"column:updated_at"`                            // Updated at
 	Disabled        bool      `json:"disabled" gorm:"column:disabled"`                                // Disabled
+	// DeletingAt is set the moment account deletion starts (before credentials
+	// are revoked and any data is removed). While non-null every authentication
+	// path rejects the account, so sessions alive before deletion can no longer
+	// create data. It is cleared again if the database deletion phase fails and
+	// rolls back; once the user row is deleted the column is gone with it.
+	DeletingAt *time.Time `json:"-" gorm:"column:deleting_at;index"`
 	// Email    string `json:"email" gorm:"column:email"`       // Email
 	CustomerID              *string                `gorm:"column:customer_id;<-:false"`                      // read only column
 	Subscription            *string                `json:"subscription" gorm:"column:subscription;<-:false"` // read only column
@@ -267,4 +273,84 @@ func (u User) ValidateParentUser() error {
 	}
 
 	return nil
+}
+
+// Account deletion lifecycle statuses. Stored in AccountDeletion.Status.
+const (
+	// DeletionStatusFenced: manifests and the credential fence are committed,
+	// the database deletion phase has not (yet) committed.
+	DeletionStatusFenced = "fenced"
+	// DeletionStatusFailed: the database phase failed and rolled back. The
+	// fence was released, the account and its ownership stay usable. Revoked
+	// credentials stay revoked; a new deletion request re-arms the same row.
+	DeletionStatusFailed = "failed"
+	// DeletionStatusStoragePending: the database phase committed (the user row
+	// is gone) but external objects still need to be retired. The row holds the
+	// remaining file manifest and contains no sensitive values.
+	DeletionStatusStoragePending = "storage_pending"
+	// DeletionStatusCompleted: database and storage phases are done.
+	DeletionStatusCompleted = "completed"
+)
+
+// AccountDeletion is the durable, resumable record of an account deletion.
+// One row per user ever (UserID is unique): a deletion that fails the database
+// phase re-arms the same row on the next attempt. The row is written before any
+// destructive step and survives the process exiting mid-deletion; recovery
+// reconciles it with database facts (does the users row still exist?) and
+// storage results.
+//
+// All manifest columns are JSON text holding non-sensitive operational data
+// only: never passwords, MFA secrets, session or token values.
+type AccountDeletion struct {
+	ID     int64 `json:"id" gorm:"primaryKey;autoIncrement"`
+	UserID int   `json:"userId" gorm:"column:user_id;not null;uniqueIndex"`
+	// Username is denormalised for logs/forensics after the user row is gone.
+	Username string `json:"username" gorm:"column:username;type:varchar(255)"`
+	Status   string `json:"status" gorm:"column:status;type:varchar(32);not null;index"`
+
+	// UserSnapshotJSON: safe user subset (id, username, display name, circle,
+	// type). No credentials or secrets.
+	UserSnapshotJSON string `json:"-" gorm:"column:user_snapshot;type:text"`
+	// TransferPlanJSON: chosen circle ownership transfers
+	// [{circleId, circleName, newOwnerId, newOwnerName}].
+	TransferPlanJSON string `json:"-" gorm:"column:transfer_plan;type:text"`
+	// DBObjectCountsJSON: per-table record counts captured before deletion
+	// (map[table]count), mirroring the dry-run impact report.
+	DBObjectCountsJSON string `json:"-" gorm:"column:db_object_counts;type:text"`
+	// StorageFilesJSON: external objects still to retire
+	// [{path,sizeBytes}]; checkpointed as files are removed.
+	StorageFilesJSON string `json:"-" gorm:"column:storage_files;type:text"`
+	// DeletedCountsJSON: per-table counts actually removed by the DB phase.
+	DeletedCountsJSON string `json:"-" gorm:"column:deleted_counts;type:text"`
+	// FileCount is the total number of external objects captured at arm time.
+	FileCount int `json:"fileCount" gorm:"column:file_count;not null;default:0"`
+
+	// LastError holds a sanitised failure message (no credentials).
+	LastError string `json:"-" gorm:"column:last_error;type:text"`
+	Attempts  int    `json:"attempts" gorm:"column:attempts;not null;default:0"`
+
+	CreatedAt      time.Time  `json:"createdAt" gorm:"column:created_at;not null"`
+	FencedAt       time.Time  `json:"fencedAt" gorm:"column:fenced_at;not null"`
+	DBCommittedAt  *time.Time `json:"dbCommittedAt" gorm:"column:db_committed_at"`
+	CompletedAt    *time.Time `json:"completedAt" gorm:"column:completed_at"`
+	LastAttemptAt  *time.Time `json:"lastAttemptAt" gorm:"column:last_attempt_at"`
+}
+
+func (AccountDeletion) TableName() string { return "account_deletions" }
+
+// DeletionUserSnapshot is the safe, secret-free user record stored in the
+// deletion manifest.
+type DeletionUserSnapshot struct {
+	ID          int    `json:"id"`
+	Username    string `json:"username"`
+	DisplayName string `json:"displayName"`
+	CircleID    int    `json:"circleId"`
+	UserType    int    `json:"userType"`
+}
+
+// DeletionFileEntry is one external storage object captured before deletion
+// and retired after the database transaction commits.
+type DeletionFileEntry struct {
+	Path      string `json:"path" gorm:"column:file_path"`
+	SizeBytes int    `json:"sizeBytes" gorm:"column:size_bytes"`
 }

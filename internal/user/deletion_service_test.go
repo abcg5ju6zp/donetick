@@ -33,7 +33,9 @@ func setupTestDeletionDB(t *testing.T) *gorm.DB {
 }
 
 type mockStorage struct {
-	deletedPaths []string
+	deletedPaths    []string
+	ensuredPaths    []string
+	ensureDeleteErr error
 }
 
 var _ storage.Storage = (*mockStorage)(nil) // Compile-time interface check
@@ -45,6 +47,13 @@ func (m *mockStorage) Save(ctx context.Context, path string, file io.Reader) err
 func (m *mockStorage) Delete(ctx context.Context, paths []string) error {
 	m.deletedPaths = append(m.deletedPaths, paths...)
 	return nil
+}
+
+// EnsureDeleted records the path; when ensureDeleteErr is set it is returned
+// to simulate an unreachable/failing object store during retirement.
+func (m *mockStorage) EnsureDeleted(ctx context.Context, path string) error {
+	m.ensuredPaths = append(m.ensuredPaths, path)
+	return m.ensureDeleteErr
 }
 
 func (m *mockStorage) GetURL(ctx context.Context, path string) (string, error) {

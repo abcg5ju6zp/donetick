@@ -5,6 +5,7 @@ import (
 	"crypto/rand"
 	"crypto/sha256"
 	"encoding/hex"
+	"errors"
 	"fmt"
 	"time"
 
@@ -41,6 +42,10 @@ type RefreshRequest struct {
 	RefreshToken string `json:"refresh_token" binding:"required"`
 }
 
+// ErrAccountDeletionInProgress is returned when credential issuance is
+// attempted for an account inside the deletion fence.
+var ErrAccountDeletionInProgress = errors.New("account deletion is in progress")
+
 // NewTokenService creates a new token service
 func NewTokenService(userRepo *uRepo.UserRepository, jwtAuth *jwt.GinJWTMiddleware, cfg *config.Config) *TokenService {
 	return &TokenService{
@@ -53,6 +58,17 @@ func NewTokenService(userRepo *uRepo.UserRepository, jwtAuth *jwt.GinJWTMiddlewa
 
 // GenerateTokens generates both access and refresh tokens for a user
 func (s *TokenService) GenerateTokens(ctx context.Context, user *uModel.UserDetails) (*TokenResponse, error) {
+	// Fresh fence check: the user object handed in can predate an in-flight
+	// deletion (e.g. an MFA or third-party login that started before the
+	// fence). No new credentials may be issued from deletion start onward.
+	deleting, err := s.userRepo.IsAccountBeingDeleted(ctx, user.ID)
+	if err != nil {
+		return nil, fmt.Errorf("failed to verify account state: %w", err)
+	}
+	if deleting {
+		return nil, ErrAccountDeletionInProgress
+	}
+
 	// Generate access token using existing JWT middleware
 	accessToken, accessExpiry, err := s.jwtAuth.TokenGenerator(user)
 	if err != nil {
@@ -128,6 +144,16 @@ func (s *TokenService) RefreshTokens(ctx context.Context, refreshToken string) (
 	userData, err := s.userRepo.GetUserByID(ctx, session.UserID)
 	if err != nil {
 		return nil, fmt.Errorf("failed to get user: %w", err)
+	}
+
+	// Deletion fence: sessions are revoked during arming anyway, but reject
+	// explicitly so a concurrent deletion always converges.
+	deleting, err := s.userRepo.IsAccountBeingDeleted(ctx, userData.ID)
+	if err != nil {
+		return nil, fmt.Errorf("failed to verify account state: %w", err)
+	}
+	if deleting {
+		return nil, ErrAccountDeletionInProgress
 	}
 
 	// Convert to UserDetails
