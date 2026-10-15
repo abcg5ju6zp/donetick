@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"sort"
+	"time"
 
 	config "donetick.com/core/config"
 	chModel "donetick.com/core/internal/chore/model"
@@ -23,6 +24,10 @@ var (
 	ErrInvalidVisibility = errors.New("invalid project visibility")
 	// ErrMemberNotInCircle rejects sharing with somebody outside the project's circle.
 	ErrMemberNotInCircle = errors.New("project members must be active members of the circle")
+	// ErrAccessChangedSincePreview rejects an update pinned to a preview baseline
+	// after another device changed the audience first, so the preview and the
+	// applied plan always share one baseline.
+	ErrAccessChangedSincePreview = errors.New("project audience changed since the access preview")
 )
 
 type ProjectRepository struct {
@@ -142,6 +147,12 @@ func (r *ProjectRepository) UpdateProject(ctx context.Context, project *pModel.P
 // change is applied to every chore of the project in the same transaction (see
 // ChoreRepository.ApplyProjectAccessChange). The returned result is nil when the
 // audience did not change.
+//
+// An audience update that affects at least one task is assigned the project's
+// next monotonically increasing access version inside this transaction. The
+// task changes, tombstones, re-sent history and a post-processing row
+// (project_access_events) all carry that version; until the transaction commits,
+// the project keeps its old audience and no revocation is sent.
 func (r *ProjectRepository) UpdateProjectWithAccess(ctx context.Context, project *pModel.Project, req *pModel.ProjectReq, userID int, circleID int) (*chRepo.ProjectAccessResult, error) {
 	log := logging.FromContext(ctx)
 	var result *chRepo.ProjectAccessResult
@@ -158,6 +169,13 @@ func (r *ProjectRepository) UpdateProjectWithAccess(ctx context.Context, project
 			return err
 		}
 		after := chRepo.ProjectAccess{Visibility: target, MemberIDs: members}
+
+		accessChanged := !sameAccess(before, after)
+		// The preview baseline only guards audience updates; a name/color edit
+		// pinned to an old preview is harmless and keeps working.
+		if accessChanged && req != nil && req.BaseAccessVersion != nil && *req.BaseAccessVersion != existing.AccessVersion {
+			return ErrAccessChangedSincePreview
+		}
 
 		updates := map[string]interface{}{
 			"name":                project.Name,
@@ -176,12 +194,42 @@ func (r *ProjectRepository) UpdateProjectWithAccess(ctx context.Context, project
 			return err
 		}
 
-		if !sameAccess(before, after) {
-			result, err = r.choreRepo.ApplyProjectAccessChange(ctx, tx, circleID, project.ID, existing.CreatedBy, before, after)
+		if accessChanged {
+			// Fix the plan for the old and the new audience under the project
+			// lock, so it matches what the owner previewed on this baseline.
+			plan, err := r.choreRepo.PlanProjectAccessChange(ctx, tx, circleID, project.ID, existing.CreatedBy, before, after)
+			if err != nil {
+				log.Error("Error planning project access change", "error", err, "projectID", project.ID)
+				return err
+			}
+			plan.AccessVersion = existing.AccessVersion
+
+			// Only an update that changes a task's assignment or audience takes
+			// a new access version and a post-processing row; audience updates
+			// that affect no task (e.g. an empty project) keep existing behavior.
+			var accessVersion int64
+			if len(plan.ChangedChores()) > 0 {
+				accessVersion, err = r.bumpProjectAccessVersion(ctx, tx, project.ID)
+				if err != nil {
+					log.Error("Error bumping project access version", "error", err, "projectID", project.ID)
+					return err
+				}
+			}
+
+			result, err = r.choreRepo.ApplyPlannedProjectAccessChange(ctx, tx, circleID, existing.CreatedBy, plan, accessVersion)
 			if err != nil {
 				log.Error("Error propagating project access to chores", "error", err, "projectID", project.ID)
+				return err
 			}
-			return err
+			if accessVersion > 0 {
+				eventID, err := r.insertAccessEvent(ctx, tx, circleID, project.ID, userID, accessVersion, result)
+				if err != nil {
+					log.Error("Error persisting project access post-processing", "error", err, "projectID", project.ID)
+					return err
+				}
+				result.EventID = eventID
+			}
+			return nil
 		}
 
 		// Clients render the project (name/color/icon) alongside its chores, so the
@@ -199,6 +247,78 @@ func (r *ProjectRepository) UpdateProjectWithAccess(ctx context.Context, project
 	return result, nil
 }
 
+// bumpProjectAccessVersion reserves the next monotonically increasing audience
+// version for a project. Must run inside the audience-update transaction while
+// the project row is locked.
+func (r *ProjectRepository) bumpProjectAccessVersion(ctx context.Context, tx *gorm.DB, projectID int) (int64, error) {
+	if err := tx.WithContext(ctx).Model(&pModel.Project{}).Where("id = ?", projectID).
+		UpdateColumn("access_version", gorm.Expr("access_version + 1")).Error; err != nil {
+		return 0, err
+	}
+	var version int64
+	if err := tx.WithContext(ctx).Model(&pModel.Project{}).Where("id = ?", projectID).
+		Select("access_version").Scan(&version).Error; err != nil {
+		return 0, err
+	}
+	return version, nil
+}
+
+// insertAccessEvent freezes the post-commit work of one audience update — who
+// lost which task (with each tombstone's sync version), which reminders must be
+// rebuilt and who must refresh — into project_access_events inside the same
+// transaction. Must run inside tx.
+func (r *ProjectRepository) insertAccessEvent(ctx context.Context, tx *gorm.DB, circleID, projectID, actorID int, accessVersion int64, result *chRepo.ProjectAccessResult) (int64, error) {
+	plan := result.Plan
+	payload := pModel.AccessEventPayload{
+		Before:               pModel.AccessSnapshot{Visibility: plan.Before.Visibility, MemberIDs: append([]int(nil), plan.Before.MemberIDs...)},
+		After:                pModel.AccessSnapshot{Visibility: plan.After.Visibility, MemberIDs: append([]int(nil), plan.After.MemberIDs...)},
+		NotificationChoreIDs: append([]int(nil), result.NotificationChoreIDs...),
+		Revocations:          result.Revocations,
+	}
+	payload.CircleWide = plan.Before.Visibility == pModel.ProjectVisibilityCircle || plan.After.Visibility == pModel.ProjectVisibilityCircle
+	if !payload.CircleWide {
+		viewers := map[int]struct{}{plan.OwnerID: {}}
+		for _, id := range plan.Before.MemberIDs {
+			viewers[id] = struct{}{}
+		}
+		for _, id := range plan.After.MemberIDs {
+			viewers[id] = struct{}{}
+		}
+		payload.Recipients = sortedViewerIDs(viewers)
+	}
+	if len(result.Revocations) > 0 {
+		payload.ChoreNames = make(map[int]string, len(result.Revocations))
+		for _, change := range plan.Chores {
+			if _, ok := result.Revocations[change.ChoreID]; ok {
+				payload.ChoreNames[change.ChoreID] = change.Name
+			}
+		}
+	}
+
+	event := &pModel.ProjectAccessEvent{
+		CircleID:      circleID,
+		ProjectID:     projectID,
+		AccessVersion: accessVersion,
+		ActorUserID:   actorID,
+		Status:        pModel.AccessEventStatusPending,
+		RunAfter:      time.Now().UTC(),
+		Payload:       payload,
+	}
+	if err := tx.WithContext(ctx).Create(event).Error; err != nil {
+		return 0, err
+	}
+	return event.ID, nil
+}
+
+func sortedViewerIDs(set map[int]struct{}) []int {
+	ids := make([]int, 0, len(set))
+	for id := range set {
+		ids = append(ids, id)
+	}
+	sort.Ints(ids)
+	return ids
+}
+
 // PreviewProjectAccess reports, without changing anything, what an update request
 // would do to the project's chores, assignments and audience.
 func (r *ProjectRepository) PreviewProjectAccess(ctx context.Context, projectID int, req *pModel.ProjectReq, userID int, circleID int) (*chRepo.ProjectAccessPlan, error) {
@@ -214,7 +334,11 @@ func (r *ProjectRepository) PreviewProjectAccess(ctx context.Context, projectID 
 		}
 		plan, err = r.choreRepo.PlanProjectAccessChange(ctx, tx, circleID, projectID, existing.CreatedBy,
 			chRepo.AccessOf(existing), chRepo.ProjectAccess{Visibility: target, MemberIDs: members})
-		return err
+		if err != nil {
+			return err
+		}
+		plan.AccessVersion = existing.AccessVersion
+		return nil
 	})
 	return plan, err
 }
@@ -446,4 +570,101 @@ func sameAccess(a, b chRepo.ProjectAccess) bool {
 		}
 	}
 	return true
+}
+
+// GetAccessEvent loads one audience-update post-processing row.
+func (r *ProjectRepository) GetAccessEvent(ctx context.Context, id int64) (*pModel.ProjectAccessEvent, error) {
+	var event pModel.ProjectAccessEvent
+	if err := r.db.WithContext(ctx).First(&event, id).Error; err != nil {
+		return nil, err
+	}
+	return &event, nil
+}
+
+// ListDueAccessEvents returns post-processing rows that are due, oldest first:
+// pending rows whose backoff has elapsed, and processing rows whose lease was
+// never released (the process died while handling them), both picked up again
+// after a restart.
+func (r *ProjectRepository) ListDueAccessEvents(ctx context.Context, now time.Time, staleBefore time.Time, limit int) ([]*pModel.ProjectAccessEvent, error) {
+	var events []*pModel.ProjectAccessEvent
+	err := r.db.WithContext(ctx).
+		Where("(status = ? AND run_after <= ?) OR (status = ? AND run_after < ?)",
+			pModel.AccessEventStatusPending, now, pModel.AccessEventStatusProcessing, staleBefore).
+		Order("id asc").Limit(limit).Find(&events).Error
+	if err != nil {
+		return nil, err
+	}
+	return events, nil
+}
+
+// ClaimAccessEvent atomically takes a row for processing: a due pending row, or
+// a processing row whose lease expired, flips to processing with a fresh lease
+// and increments attempts. It reports false when another worker claimed it.
+func (r *ProjectRepository) ClaimAccessEvent(ctx context.Context, id int64, now time.Time, lease time.Duration) (bool, error) {
+	res := r.db.WithContext(ctx).Model(&pModel.ProjectAccessEvent{}).
+		Where("id = ? AND ((status = ? AND run_after <= ?) OR (status = ? AND run_after < ?))",
+			id, pModel.AccessEventStatusPending, now, pModel.AccessEventStatusProcessing, now.Add(-lease)).
+		Updates(map[string]interface{}{
+			"status":     pModel.AccessEventStatusProcessing,
+			"attempts":   gorm.Expr("attempts + 1"),
+			"run_after":  now.Add(lease),
+			"last_error": "",
+		})
+	if res.Error != nil {
+		return false, res.Error
+	}
+	return res.RowsAffected == 1, nil
+}
+
+// CompleteAccessEvent marks post-processing of an audience update as done.
+func (r *ProjectRepository) CompleteAccessEvent(ctx context.Context, id int64, completedAt time.Time) error {
+	return r.db.WithContext(ctx).Model(&pModel.ProjectAccessEvent{}).Where("id = ?", id).
+		Updates(map[string]interface{}{
+			"status":       pModel.AccessEventStatusCompleted,
+			"completed_at": completedAt,
+			"last_error":   "",
+		}).Error
+}
+
+// FailAccessEvent hands a row back to the pending queue with an exponential
+// backoff so persistent post-processing failures do not spin, while staying
+// durable across restarts.
+func (r *ProjectRepository) FailAccessEvent(ctx context.Context, id int64, runAfter time.Time, lastError string) error {
+	return r.db.WithContext(ctx).Model(&pModel.ProjectAccessEvent{}).Where("id = ?", id).
+		Updates(map[string]interface{}{
+			"status":     pModel.AccessEventStatusPending,
+			"run_after":  runAfter,
+			"last_error": lastError,
+		}).Error
+}
+
+// CurrentProjectAccessVersion returns the project's current audience version and
+// whether the project still exists. Post-processing uses it to detect that a
+// newer audience update has superseded its snapshot.
+func (r *ProjectRepository) CurrentProjectAccessVersion(ctx context.Context, projectID int) (int64, bool, error) {
+	var project pModel.Project
+	err := r.db.WithContext(ctx).Select("id", "access_version").First(&project, projectID).Error
+	if errors.Is(err, gorm.ErrRecordNotFound) {
+		return 0, false, nil
+	}
+	if err != nil {
+		return 0, false, err
+	}
+	return project.AccessVersion, true, nil
+}
+
+// AccessTombstoneAlive reports whether the exact user-scoped chore tombstone
+// written for an audience update still exists. Re-granting access deletes it, so
+// a stale post-processing retry does not re-send a revocation for access that a
+// newer version restored.
+func (r *ProjectRepository) AccessTombstoneAlive(ctx context.Context, circleID, choreID, userID int, syncVersion int64) (bool, error) {
+	var count int64
+	err := r.db.WithContext(ctx).Model(&syncModel.Tombstone{}).
+		Where("circle_id = ? AND entity_type = ? AND entity_id = ? AND user_id = ? AND sync_version = ?",
+			circleID, syncModel.EntityTypeChore, choreID, userID, syncVersion).
+		Count(&count).Error
+	if err != nil {
+		return false, err
+	}
+	return count > 0, nil
 }

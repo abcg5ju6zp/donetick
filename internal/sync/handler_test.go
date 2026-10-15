@@ -53,6 +53,7 @@ func newSyncHandlerTest(t *testing.T) (*chRepo.ChoreRepository, *gorm.DB, *gin.E
 		&syncModel.Tombstone{},
 		&pModel.Project{},
 		&pModel.ProjectMember{},
+		&pModel.ProjectAccessEvent{},
 	))
 
 	cfg := &config.Config{}

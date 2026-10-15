@@ -71,7 +71,7 @@ func TestGenerateNotificationsFromTemplateUnassignedTargetsRecipient(t *testing.
 	// addressed to the recipient and must not claim to be assigned to anyone.
 	recipient := member(3, true, nModel.NotificationPlatformPushover, "recipient-key")
 
-	notifications := generateNotificationsFromTemplate(choreDueTomorrow(), recipient, nil, nil)
+	notifications := generateNotificationsFromTemplate(choreDueTomorrow(), recipient, nil, nil, 0)
 
 	if len(notifications) != 1 {
 		t.Fatalf("expected 1 notification, got %d", len(notifications))
@@ -108,7 +108,7 @@ func TestGenerateNotificationsFromTemplateAssignedIsUnchanged(t *testing.T) {
 	assignedUser.DisplayName = "Alice"
 	assignedUser.Username = "alice"
 
-	notifications := generateNotificationsFromTemplate(choreDueTomorrow(), assignedUser, assignedUser, nil)
+	notifications := generateNotificationsFromTemplate(choreDueTomorrow(), assignedUser, assignedUser, nil, 0)
 
 	if len(notifications) != 1 {
 		t.Fatalf("expected 1 notification, got %d", len(notifications))
@@ -131,7 +131,7 @@ func TestGenerateNotificationsFromTemplateOverrideTargetWins(t *testing.T) {
 	assignedUser := member(3, true, nModel.NotificationPlatformTelegram, "personal-chat")
 	groupID := int64(-100123)
 
-	notifications := generateNotificationsFromTemplate(choreDueTomorrow(), assignedUser, assignedUser, &groupID)
+	notifications := generateNotificationsFromTemplate(choreDueTomorrow(), assignedUser, assignedUser, &groupID, 0)
 
 	if len(notifications) != 1 {
 		t.Fatalf("expected 1 notification, got %d", len(notifications))
@@ -152,7 +152,7 @@ func TestGenerateNotificationsFromTemplateFanOutPerMember(t *testing.T) {
 
 	notifications := make([]*nModel.Notification, 0)
 	for _, m := range members {
-		notifications = append(notifications, generateNotificationsFromTemplate(chore, m, nil, nil)...)
+		notifications = append(notifications, generateNotificationsFromTemplate(chore, m, nil, nil, 0)...)
 	}
 
 	if len(notifications) != 2 {

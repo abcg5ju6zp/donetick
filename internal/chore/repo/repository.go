@@ -319,7 +319,7 @@ func (r *ChoreRepository) updateChoreVisibility(ctx context.Context, chore *chMo
 				choreID: chore.ID,
 				revoked: revokedUserIDs,
 				granted: grantedUserIDs,
-			}}); err != nil {
+			}}, 0); err != nil {
 				return err
 			}
 		}
@@ -423,7 +423,7 @@ func (r *ChoreRepository) SetProjectChoresPrivacy(ctx context.Context, tx *gorm.
 	if isPrivate {
 		before, after = after, before
 	}
-	_, err := r.ApplyProjectAccessChange(ctx, tx, circleID, projectID, ownerID, before, after)
+	_, err := r.ApplyProjectAccessChange(ctx, tx, circleID, projectID, ownerID, before, after, 0)
 	return err
 }
 

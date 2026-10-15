@@ -21,4 +21,9 @@ type Tombstone struct {
 	EntityID    int        `json:"entityId" gorm:"column:entity_id;not null;index:idx_tombstone_sync"`
 	UserID      *int       `json:"-" gorm:"column:user_id;index:idx_tombstone_retrieval,priority:3"`
 	SyncVersion int64      `json:"syncVersion" gorm:"column:sync_version;not null;index:idx_tombstone_sync;index:idx_tombstone_retrieval,priority:4"`
+	// AccessVersion is the project audience version (projects.access_version)
+	// that wrote this tombstone; 0 for tombstones unrelated to an audience
+	// update. Post-processing of that same version replays the deletion only
+	// while this row still exists — re-granting access deletes it.
+	AccessVersion int64    `json:"-" gorm:"column:access_version;not null;default:0"`
 }

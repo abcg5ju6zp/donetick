@@ -57,6 +57,7 @@ func Migration(db *gorm.DB) error {
 		chModel.ChoreLabels{},
 		projModel.Project{},
 		projModel.ProjectMember{},
+		projModel.ProjectAccessEvent{},
 		filterModel.Filter{},
 		migrations.Migration{},
 		pModel.PointsHistory{},

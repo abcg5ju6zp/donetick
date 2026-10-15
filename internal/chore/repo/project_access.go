@@ -75,6 +75,11 @@ type ProjectAccessPlan struct {
 	OwnerID   int           `json:"ownerId"`
 	Before    ProjectAccess `json:"before"`
 	After     ProjectAccess `json:"after"`
+	// AccessVersion is the project's audience version this plan was computed
+	// from (the preview baseline). An update carrying that same baseline is
+	// rejected if another update landed in the meantime, so the preview and the
+	// applied plan always share one baseline.
+	AccessVersion int64 `json:"accessVersion"`
 	// Chores lists every chore of the project; most entries carry no change.
 	Chores []*ChoreAccessChange `json:"chores"`
 	// RevokedUsers lost sight of at least one chore, GrantedUsers gained it.
@@ -97,6 +102,13 @@ func (p *ProjectAccessPlan) ChangedChores() []*ChoreAccessChange {
 // post-commit work (realtime events, notification regeneration).
 type ProjectAccessResult struct {
 	Plan *ProjectAccessPlan
+	// AccessVersion is the project audience version assigned to this update;
+	// every artifact of the update carries it. 0 for callers that do not take
+	// part in access-versioned updates (legacy boolean flips, project deletion).
+	AccessVersion int64
+	// EventID is the persisted post-processing row (project_access_events) the
+	// caller must dispatch after commit; 0 when no such row was written.
+	EventID int64
 	// ChoreIDs whose pending notifications were dropped and must be regenerated.
 	NotificationChoreIDs []int
 	// Revocations maps chore ID to the users that lost it, with the sync version of
@@ -296,7 +308,11 @@ func narrowToViewers(change *ChoreAccessChange, chore projectChoreRow, prevAssig
 //     and their older user-scoped tombstones for it are dropped,
 //   - pending notifications of changed chores are removed; the caller regenerates
 //     them after commit (see ProjectAccessResult.NotificationChoreIDs).
-func (r *ChoreRepository) ApplyProjectAccessChange(ctx context.Context, tx *gorm.DB, circleID, projectID, ownerID int, before, after ProjectAccess) (*ProjectAccessResult, error) {
+//
+// accessVersion is the project audience version assigned to this update; every
+// written chore, tombstone and re-sent history row carries it. Pass 0 from
+// callers that predate access versions (legacy boolean flips, project deletion).
+func (r *ChoreRepository) ApplyProjectAccessChange(ctx context.Context, tx *gorm.DB, circleID, projectID, ownerID int, before, after ProjectAccess, accessVersion int64) (*ProjectAccessResult, error) {
 	if tx == nil {
 		tx = r.db
 	}
@@ -304,7 +320,18 @@ func (r *ChoreRepository) ApplyProjectAccessChange(ctx context.Context, tx *gorm
 	if err != nil {
 		return nil, err
 	}
-	result := &ProjectAccessResult{Plan: plan, Revocations: map[int]map[int]int64{}}
+	return r.ApplyPlannedProjectAccessChange(ctx, tx, circleID, ownerID, plan, accessVersion)
+}
+
+// ApplyPlannedProjectAccessChange applies a plan that was computed earlier in the
+// same transaction (e.g. by PreviewProjectAccess's sibling code path in the
+// project repository). Everything runs under the project row lock the plan was
+// computed under, so the plan cannot have gone stale.
+func (r *ChoreRepository) ApplyPlannedProjectAccessChange(ctx context.Context, tx *gorm.DB, circleID, ownerID int, plan *ProjectAccessPlan, accessVersion int64) (*ProjectAccessResult, error) {
+	if tx == nil {
+		tx = r.db
+	}
+	result := &ProjectAccessResult{Plan: plan, AccessVersion: accessVersion, Revocations: map[int]map[int]int64{}}
 	if len(plan.Chores) == 0 {
 		return result, nil
 	}
@@ -346,6 +373,9 @@ func (r *ChoreRepository) ApplyProjectAccessChange(ctx context.Context, tx *gorm
 		}
 		fields := map[string]interface{}{"sync_version": nextVersion}
 		nextVersion++
+		if accessVersion > 0 {
+			fields["access_version"] = accessVersion
+		}
 		if change.isPrivateBefore != change.isPrivateAfter {
 			fields["is_private"] = change.isPrivateAfter
 		}
@@ -364,7 +394,7 @@ func (r *ChoreRepository) ApplyProjectAccessChange(ctx context.Context, tx *gorm
 		}
 	}
 
-	revocations, err := r.applyVisibilityDeltas(ctx, tx, circleID, deltas)
+	revocations, err := r.applyVisibilityDeltas(ctx, tx, circleID, deltas, accessVersion)
 	if err != nil {
 		return nil, err
 	}
@@ -389,7 +419,10 @@ type visibilityDelta struct {
 //     client that syncs the revocation and the re-grant together keeps the chore.
 //
 // It returns, per chore and revoked user, the version of the chore tombstone.
-func (r *ChoreRepository) applyVisibilityDeltas(ctx context.Context, tx *gorm.DB, circleID int, deltas []visibilityDelta) (map[int]map[int]int64, error) {
+// Every row it writes (tombstones, re-versioned history) carries accessVersion,
+// the project audience version of this update; pass 0 from callers that predate
+// access versions.
+func (r *ChoreRepository) applyVisibilityDeltas(ctx context.Context, tx *gorm.DB, circleID int, deltas []visibilityDelta, accessVersion int64) (map[int]map[int]int64, error) {
 	revocations := map[int]map[int]int64{}
 	if len(deltas) == 0 {
 		return revocations, nil
@@ -436,21 +469,25 @@ func (r *ChoreRepository) applyVisibilityDeltas(ctx context.Context, tx *gorm.DB
 			revocations[d.choreID][user] = nextVersion
 			tombstones = append(tombstones, syncModel.Tombstone{
 				CircleID: circleID, EntityType: syncModel.EntityTypeChore, EntityID: d.choreID,
-				UserID: &user, SyncVersion: nextVersion,
+				UserID: &user, SyncVersion: nextVersion, AccessVersion: accessVersion,
 			})
 			nextVersion++
 			for _, historyID := range historyIDs {
 				tombstones = append(tombstones, syncModel.Tombstone{
 					CircleID: circleID, EntityType: syncModel.EntityTypeChoreHistory, EntityID: historyID,
-					UserID: &user, SyncVersion: nextVersion,
+					UserID: &user, SyncVersion: nextVersion, AccessVersion: accessVersion,
 				})
 				nextVersion++
 			}
 		}
 		if len(d.granted) > 0 {
 			for _, historyID := range historyIDs {
+				updates := map[string]interface{}{"sync_version": nextVersion}
+				if accessVersion > 0 {
+					updates["access_version"] = accessVersion
+				}
 				if err := tx.WithContext(ctx).Model(&chModel.ChoreHistory{}).Where("id = ?", historyID).
-					Update("sync_version", nextVersion).Error; err != nil {
+					Updates(updates).Error; err != nil {
 					return nil, err
 				}
 				nextVersion++
@@ -688,7 +725,7 @@ func (r *ChoreRepository) DetachProjectChores(ctx context.Context, tx *gorm.DB, 
 			return nil, err
 		}
 	}
-	if _, err := r.applyVisibilityDeltas(ctx, tx, circleID, deltas); err != nil {
+	if _, err := r.applyVisibilityDeltas(ctx, tx, circleID, deltas, 0); err != nil {
 		return nil, err
 	}
 	return revokedChores, nil

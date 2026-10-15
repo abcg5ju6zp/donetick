@@ -19,6 +19,9 @@ type Notification struct {
 	ScheduledFor time.Time            `json:"scheduled_for" gorm:"column:scheduled_for;index"`
 	CreatedAt    time.Time            `json:"created_at" gorm:"column:created_at"`
 	RawEvent     JSONB                `json:"raw_event" gorm:"column:raw_event;type:jsonb"`
+	// AccessVersion is the project audience version that rebuilt this reminder;
+	// 0 for reminders unrelated to an audience update.
+	AccessVersion int64               `json:"accessVersion,omitempty" gorm:"column:access_version;not null;default:0"`
 }
 type NotificationDetails struct {
 	Notification

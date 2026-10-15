@@ -25,6 +25,15 @@ func NewNotificationPlanner(nr *nRepo.NotificationRepository, cr *cRepo.CircleRe
 }
 
 func (n *NotificationPlanner) GenerateNotifications(c context.Context, chore *chModel.Chore) bool {
+	return n.GenerateNotificationsWithAccessVersion(c, chore, 0)
+}
+
+// GenerateNotificationsWithAccessVersion is GenerateNotifications for reminders
+// rebuilt after an audience update: every regenerated row carries that update's
+// access version. Rebuilding always reads the chore's CURRENT audience, so a
+// retry of an older version can only recreate reminders for users who may still
+// see the task.
+func (n *NotificationPlanner) GenerateNotificationsWithAccessVersion(c context.Context, chore *chModel.Chore, accessVersion int64) bool {
 	log := logging.FromContext(c)
 	circleMembers, err := n.cRepo.GetCircleUsers(c, chore.CircleID)
 	if err != nil {
@@ -53,13 +62,13 @@ func (n *NotificationPlanner) GenerateNotifications(c context.Context, chore *ch
 
 	if len(chore.NotificationMetadataV2.Templates) > 0 {
 		if assignedUser != nil && canReceiveChore(chore, assignedUser.UserID, circleMembers) {
-			notifications = append(notifications, generateNotificationsFromTemplate(chore, assignedUser, assignedUser, nil)...)
+			notifications = append(notifications, generateNotificationsFromTemplate(chore, assignedUser, assignedUser, nil, accessVersion)...)
 		} else if assignedUser == nil {
 			// A chore assigned to "Anyone" has no assigned user to resolve, which previously
 			// meant no notifications were generated at all. Remind every circle member who
 			// can actually receive one instead.
 			for _, member := range anyoneChoreRecipients(chore, circleMembers) {
-				notifications = append(notifications, generateNotificationsFromTemplate(chore, member, nil, nil)...)
+				notifications = append(notifications, generateNotificationsFromTemplate(chore, member, nil, nil, accessVersion)...)
 			}
 		}
 	}
@@ -67,7 +76,7 @@ func (n *NotificationPlanner) GenerateNotifications(c context.Context, chore *ch
 	// A circle group chat reaches everybody in it, so chores of a restricted project
 	// (only me / selected members) are never posted there.
 	if chore.NotificationMetadataV2.CircleGroup && !inRestrictedProject(chore) && assignedUser != nil && canReceiveChore(chore, assignedUser.UserID, circleMembers) {
-		notifications = append(notifications, generateNotificationsFromTemplate(chore, assignedUser, assignedUser, chore.NotificationMetadataV2.CircleGroupID)...)
+		notifications = append(notifications, generateNotificationsFromTemplate(chore, assignedUser, assignedUser, chore.NotificationMetadataV2.CircleGroupID, accessVersion)...)
 	}
 
 	log.Debug("Generated notifications", "count", len(notifications))
@@ -174,7 +183,8 @@ func calculateScheduledTime(baseTime time.Time, template *chModel.NotificationTe
 // generateNotificationsFromTemplate builds the scheduled notifications for one recipient.
 // assignedUser is who the chore is assigned to and is only used for the message wording; it
 // is nil for a chore assigned to "Anyone", where recipient is each circle member in turn.
-func generateNotificationsFromTemplate(chore *chModel.Chore, recipient *cModel.UserCircleDetail, assignedUser *cModel.UserCircleDetail, overrideTarget *int64) []*nModel.Notification {
+// accessVersion tags every row with the audience update that rebuilt it (0 otherwise).
+func generateNotificationsFromTemplate(chore *chModel.Chore, recipient *cModel.UserCircleDetail, assignedUser *cModel.UserCircleDetail, overrideTarget *int64, accessVersion int64) []*nModel.Notification {
 	if len(chore.NotificationMetadataV2.Templates) == 0 {
 		return nil // No templates to process
 	}
@@ -215,6 +225,7 @@ func generateNotificationsFromTemplate(chore *chModel.Chore, recipient *cModel.U
 			CircleID:     recipient.CircleID,
 			TargetID:     targetID,
 			Text:         text,
+			AccessVersion: accessVersion,
 			RawEvent: map[string]interface{}{
 				"id":                chore.ID,
 				"type":              eventType,

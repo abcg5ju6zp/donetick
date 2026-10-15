@@ -79,6 +79,11 @@ type Chore struct {
 	ProjectID              *int                       `json:"projectId,omitempty" gorm:"column:project_id;index"`                                     // The project this chore belongs to
 	Project                *pModel.Project            `json:"project,omitempty" gorm:"foreignkey:ProjectID;references:ID"`                            // Project relationship
 	SyncVersion            int64                      `json:"syncVersion" gorm:"column:sync_version;not null;default:0;index;index:idx_chores_circle_sync_version,priority:2"`
+	// AccessVersion is the project audience version (projects.access_version) of
+	// the last audience update that touched this chore; 0 for chores never part
+	// of one. It ties the chore row to the tombstones, reminders and events of
+	// the same update.
+	AccessVersion          int64                      `json:"accessVersion,omitempty" gorm:"column:access_version;not null;default:0"`
 	Attachments            []storageModel.StorageFile `json:"attachments,omitempty" gorm:"-"`
 }
 
@@ -110,6 +115,9 @@ type ChoreHistory struct {
 	Points      *int               `json:"points,omitempty" gorm:"column:points"`                       // Points for completing the chore
 	Duration    *int               `json:"duration,omitempty" gorm:"<-:false;-:migration"`              // Duration in seconds calculated from query (read-only, no DB column)
 	SyncVersion int64              `json:"syncVersion" gorm:"column:sync_version;not null;default:0;index:idx_chore_history_sync_version"`
+	// AccessVersion is the project audience version that re-sent this history to
+	// a user who regained sight of the chore; 0 otherwise.
+	AccessVersion int64           `json:"accessVersion,omitempty" gorm:"column:access_version;not null;default:0"`
 }
 
 type ChoreHistoryStatus int8

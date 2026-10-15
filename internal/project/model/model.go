@@ -59,6 +59,15 @@ type Project struct {
 	// closed for everybody but the owner.
 	MemberIDs     []int `json:"-" gorm:"-"`
 	membersLoaded bool
+
+	// AccessVersion is the project's monotonically increasing audience version.
+	// It is bumped inside the audience-update transaction (alongside the task
+	// assignment, tombstone and history changes) and every artifact of that
+	// update — tombstones, re-sent history, rebuilt reminders, realtime events
+	// and the post-processing row — carries it, so later updates override stale
+	// retries and old events cannot re-revoke restored access. Renames, color
+	// edits and audience updates that affect no task leave it untouched.
+	AccessVersion int64 `json:"accessVersion" gorm:"column:access_version;not null;default:0"`
 }
 
 // ProjectMember grants one user of the project's circle access to a project whose
@@ -179,7 +188,71 @@ type ProjectReq struct {
 	// MemberIDs is only read together with visibility "members". When omitted
 	// there, the current member list is kept.
 	MemberIDs *[]int `json:"memberIds"`
+	// BaseAccessVersion is the audience version returned by the access preview
+	// the client is about to save. When present, the update is rejected with
+	// ErrAccessChangedSincePreview if another device changed the audience in the
+	// meantime, so the preview and the applied plan always share one baseline.
+	BaseAccessVersion *int64 `json:"baseAccessVersion,omitempty"`
 }
+
+// Post-processing status of a ProjectAccessEvent.
+const (
+	AccessEventStatusPending    = "pending"
+	AccessEventStatusProcessing = "processing"
+	AccessEventStatusCompleted  = "completed"
+)
+
+// AccessSnapshot is the audience fixed by one audience update.
+type AccessSnapshot struct {
+	Visibility ProjectVisibility `json:"visibility"`
+	MemberIDs  []int             `json:"memberIds"`
+}
+
+// AccessEventPayload is the frozen post-commit work of one audience update. It
+// is written inside the updating transaction, so a crash after commit loses
+// nothing: reminders are rebuilt and realtime events are sent from this exact
+// snapshot, and the snapshot's AccessVersion on the parent row lets the
+// processor skip work that a newer audience version has superseded.
+type AccessEventPayload struct {
+	// Before and After are the audiences on either side of the update.
+	Before AccessSnapshot `json:"before"`
+	After  AccessSnapshot `json:"after"`
+	// NotificationChoreIDs are the chores whose pending reminders were dropped
+	// inside the transaction and must be planned again for whoever may still see
+	// them.
+	NotificationChoreIDs []int `json:"notificationChoreIds,omitempty"`
+	// Revocations maps a chore ID to the users that lost it and, per user, the
+	// sync version of their user-scoped tombstone. A revocation is replayed only
+	// while that exact tombstone still exists; re-granting access deletes it.
+	Revocations map[int]map[int]int64 `json:"revocations,omitempty"`
+	// ChoreNames names the revoked chores for the realtime deletion events.
+	ChoreNames map[int]string `json:"choreNames,omitempty"`
+	// Recipients of the project-updated refresh event; nil/empty with
+	// CircleWide set reaches the whole circle.
+	Recipients []int `json:"recipients,omitempty"`
+	CircleWide bool  `json:"circleWide"`
+}
+
+// ProjectAccessEvent is the persistent outbox of one audience update. One row
+// per access version, inserted in the same transaction as the change. The
+// post-commit processor performs reminder rebuilds and realtime broadcasts from
+// it, retries with backoff, and picks it up again after a restart.
+type ProjectAccessEvent struct {
+	ID            int64              `json:"id" gorm:"primaryKey;autoIncrement"`
+	CircleID      int                `json:"circleId" gorm:"column:circle_id;not null;index"`
+	ProjectID     int                `json:"projectId" gorm:"column:project_id;not null;uniqueIndex:idx_project_access_event_version,priority:1"`
+	AccessVersion int64              `json:"accessVersion" gorm:"column:access_version;not null;uniqueIndex:idx_project_access_event_version,priority:2"`
+	ActorUserID   int                `json:"actorUserId" gorm:"column:actor_user_id;not null"`
+	Status        string             `json:"status" gorm:"column:status;type:varchar(16);not null;default:'pending';index"`
+	Attempts      int                `json:"attempts" gorm:"column:attempts;not null;default:0"`
+	RunAfter      time.Time          `json:"runAfter" gorm:"column:run_after;not null;index"`
+	LastError     string             `json:"lastError,omitempty" gorm:"column:last_error"`
+	Payload       AccessEventPayload `json:"payload" gorm:"serializer:json;type:json"`
+	CreatedAt     time.Time          `json:"createdAt" gorm:"column:created_at;autoCreateTime"`
+	CompletedAt   *time.Time         `json:"completedAt,omitempty" gorm:"column:completed_at"`
+}
+
+func (ProjectAccessEvent) TableName() string { return "project_access_events" }
 
 // ResolveAccess turns a request into the access the project should end up with,
 // starting from the current state. It never widens access on its own: a field

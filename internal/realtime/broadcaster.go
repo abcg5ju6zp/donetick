@@ -3,6 +3,7 @@ package realtime
 import (
 	"crypto/rand"
 	"encoding/hex"
+	"fmt"
 	"time"
 
 	"donetick.com/core/config"
@@ -57,27 +58,44 @@ func (b *EventBroadcaster) broadcastChoreEvent(chore *chModel.Chore, event *Even
 
 // BroadcastChoreAccessRevoked tells users who just lost sight of a chore to drop it,
 // using the regular deletion event so older clients handle it too. versions maps
-// each user to the sync version of their tombstone.
-func (b *EventBroadcaster) BroadcastChoreAccessRevoked(circleID, choreID int, choreName string, user *uModel.User, versions map[int]int64) {
+// each user to the sync version of their tombstone. accessVersion is the project
+// audience version of the update; with it set, the event ID is deterministic so a
+// post-processing retry delivers the same event instead of a duplicate, and a
+// client that already knows a newer audience version may ignore it.
+func (b *EventBroadcaster) BroadcastChoreAccessRevoked(circleID, choreID int, choreName string, user *uModel.User, accessVersion int64, versions map[int]int64) {
 	if !b.service.config.Enabled {
 		return
 	}
 	for userID, version := range versions {
 		event := NewChoreDeletedEvent(choreID, choreName, circleID, user)
-		event.ID = b.generateEventID()
 		event.SyncVersion = version
+		event.AccessVersion = accessVersion
+		if accessVersion > 0 {
+			event.ID = fmt.Sprintf("pa-revoke:%d:%d:%d:%d:%d", circleID, accessVersion, choreID, userID, version)
+		} else {
+			event.ID = b.generateEventID()
+		}
 		b.service.BroadcastToUsers(circleID, []int{userID}, event)
 	}
 }
 
 // BroadcastProjectUpdated notifies users that a project changed. recipients nil
-// means the whole circle.
-func (b *EventBroadcaster) BroadcastProjectUpdated(circleID, projectID int, accessChanged bool, user *uModel.User, recipients []int) {
+// means the whole circle. accessVersion tags an audience update (0 for renames,
+// colors and deletion) and makes the event ID deterministic for retries.
+func (b *EventBroadcaster) BroadcastProjectUpdated(circleID, projectID int, accessVersion int64, accessChanged bool, user *uModel.User, recipients []int) {
 	if !b.service.config.Enabled {
 		return
 	}
 	event := NewProjectUpdatedEvent(circleID, projectID, accessChanged, user)
-	event.ID = b.generateEventID()
+	if data, ok := event.Data.(*ProjectEventData); ok {
+		data.AccessVersion = accessVersion
+	}
+	event.AccessVersion = accessVersion
+	if accessVersion > 0 {
+		event.ID = fmt.Sprintf("pa-project:%d:%d:%d", circleID, projectID, accessVersion)
+	} else {
+		event.ID = b.generateEventID()
+	}
 	if recipients == nil {
 		b.service.BroadcastToCircle(circleID, event)
 		return

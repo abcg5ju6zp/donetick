@@ -173,6 +173,7 @@ func main() {
 
 		// Projects:
 		fx.Provide(pjRepo.NewProjectRepository),
+		fx.Provide(project.NewAccessProcessor),
 		fx.Provide(project.NewHandler),
 
 		// Filters:
@@ -260,7 +261,7 @@ func main() {
 
 }
 
-func newServer(lc fx.Lifecycle, cfg *config.Config, db *gorm.DB, notifier *notifier.Scheduler, eventProducer *events.EventsProducer, mfaCleanup *mfa.CleanupService, authCleanup *auth.CleanupService, rts *realtime.RealTimeService, draftCleanup *storage.DraftCleanupService, ticketStore *realtime.TicketStore) *gin.Engine {
+func newServer(lc fx.Lifecycle, cfg *config.Config, db *gorm.DB, notifier *notifier.Scheduler, eventProducer *events.EventsProducer, mfaCleanup *mfa.CleanupService, authCleanup *auth.CleanupService, rts *realtime.RealTimeService, draftCleanup *storage.DraftCleanupService, ticketStore *realtime.TicketStore, accessProcessor *project.AccessProcessor) *gin.Engine {
 	// Set Gin mode based on logging configuration
 	if cfg.Logging.Development || strings.ToLower(cfg.Logging.Level) == "debug" {
 		gin.SetMode(gin.DebugMode)
@@ -329,6 +330,9 @@ func newServer(lc fx.Lifecycle, cfg *config.Config, db *gorm.DB, notifier *notif
 				log.Printf("Failed to start real-time service: %v", err)
 			}
 
+			// Replay durable post-commit work of project audience updates.
+			accessProcessor.Start(context.Background())
+
 			go func() {
 				if err := srv.ListenAndServe(); err != nil && err != http.ErrServerClosed {
 					log.Fatalf("listen: %s\n", err)
@@ -358,6 +362,9 @@ func newServer(lc fx.Lifecycle, cfg *config.Config, db *gorm.DB, notifier *notif
 
 			// Stop the SSE ticket store cleanup goroutine
 			ticketStore.Stop()
+
+			// Stop the project audience post-processing sweep.
+			accessProcessor.Stop()
 
 			// Shutdown HTTP server with timeout
 			shutdownCtx, cancel := context.WithTimeout(context.Background(), 5*time.Second)

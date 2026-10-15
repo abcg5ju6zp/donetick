@@ -44,8 +44,13 @@ type Event struct {
 	Timestamp   time.Time   `json:"timestamp"`
 	CircleID    int         `json:"circleId"`
 	SyncVersion int64       `json:"syncVersion"`
-	Data        interface{} `json:"data"`
-	ID          string      `json:"id,omitempty"`
+	// AccessVersion is the project audience version
+	// (projects.access_version) this event belongs to. Clients may ignore an
+	// event whose access version is older than the state they already know, so
+	// retried post-processing of a superseded update cannot undo a later one.
+	AccessVersion int64       `json:"accessVersion,omitempty"`
+	Data          interface{} `json:"data"`
+	ID            string      `json:"id,omitempty"`
 }
 
 // ChoreEventData contains data for chore-related events
@@ -222,6 +227,9 @@ func NewErrorEvent(circleID int, code, message string) *Event {
 type ProjectEventData struct {
 	ProjectID     int          `json:"projectId"`
 	AccessChanged bool         `json:"accessChanged"`
+	// AccessVersion is the audience version of the update; 0 for changes that
+	// do not alter access (rename, color, deletion).
+	AccessVersion int64        `json:"accessVersion,omitempty"`
 	User          *uModel.User `json:"user"`
 }
 

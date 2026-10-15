@@ -21,14 +21,16 @@ type Handler struct {
 	choreRepo       *chRepo.ChoreRepository
 	nPlanner        *nps.NotificationPlanner
 	realTimeService *realtime.RealTimeService
+	accessProcessor *AccessProcessor
 }
 
-func NewHandler(pRepo *pRepo.ProjectRepository, choreRepo *chRepo.ChoreRepository, planner *nps.NotificationPlanner, rts *realtime.RealTimeService) *Handler {
+func NewHandler(pRepo *pRepo.ProjectRepository, choreRepo *chRepo.ChoreRepository, planner *nps.NotificationPlanner, rts *realtime.RealTimeService, accessProcessor *AccessProcessor) *Handler {
 	return &Handler{
 		pRepo:           pRepo,
 		choreRepo:       choreRepo,
 		nPlanner:        planner,
 		realTimeService: rts,
+		accessProcessor: accessProcessor,
 	}
 }
 
@@ -37,6 +39,8 @@ func statusFor(err error) int {
 	switch {
 	case errors.Is(err, pRepo.ErrProjectNotFound):
 		return 404
+	case errors.Is(err, pRepo.ErrAccessChangedSincePreview):
+		return 409
 	case errors.Is(err, pRepo.ErrInvalidVisibility), errors.Is(err, pRepo.ErrMemberNotInCircle):
 		return 400
 	case err != nil && (err.Error() == "user does not have permission to update this project" ||
@@ -162,6 +166,7 @@ func (h *Handler) createProject(c *gin.Context) {
 //	@Failure		401		{object}	map[string]string			"error: Error getting current user"
 //	@Failure		403		{object}	map[string]string			"error: not the project owner"
 //	@Failure		404		{object}	map[string]string			"error: project not found"
+//	@Failure		409		{object}	map[string]string			"error: audience changed since the access preview (baseAccessVersion is stale)"
 //	@Failure		500		{object}	map[string]string			"error: Error updating project or Error getting updated project"
 //	@Router			/projects/{id} [put]
 func (h *Handler) updateProject(c *gin.Context) {
@@ -230,7 +235,7 @@ type AccessPreviewReq struct {
 // previewProjectAccess godoc
 //
 //	@Summary		Preview a change of who can see a project
-//	@Description	Returns, without changing anything, which tasks of the project would change assignees and who would gain or lose access if the given visibility and members were saved. Only the project owner may call it.
+//	@Description	Returns, without changing anything, which tasks of the project would change assignees and who would gain or lose access if the given visibility and members were saved, plus the accessVersion baseline to echo back as baseAccessVersion when saving so a concurrent audience change is rejected with 409. Only the project owner may call it.
 //	@Tags			projects
 //	@Accept			json
 //	@Produce		json
@@ -270,13 +275,14 @@ func (h *Handler) previewProjectAccess(c *gin.Context) {
 	}
 	c.JSON(200, gin.H{
 		"res": gin.H{
-			"before":       plan.Before,
-			"after":        plan.After,
-			"ownerId":      plan.OwnerID,
-			"totalChores":  len(plan.Chores),
-			"changes":      plan.ChangedChores(),
-			"revokedUsers": plan.RevokedUsers,
-			"grantedUsers": plan.GrantedUsers,
+			"before":        plan.Before,
+			"after":         plan.After,
+			"ownerId":       plan.OwnerID,
+			"accessVersion": plan.AccessVersion,
+			"totalChores":   len(plan.Chores),
+			"changes":       plan.ChangedChores(),
+			"revokedUsers":  plan.RevokedUsers,
+			"grantedUsers":  plan.GrantedUsers,
 		},
 	})
 }
@@ -338,7 +344,7 @@ func (h *Handler) deleteProject(c *gin.Context) {
 
 	if before != nil && h.realTimeService != nil {
 		recipients, _ := before.ViewerIDs()
-		h.realTimeService.GetEventBroadcaster().BroadcastProjectUpdated(currentUser.CircleID, projectID, true, &currentUser.User, recipients)
+		h.realTimeService.GetEventBroadcaster().BroadcastProjectUpdated(currentUser.CircleID, projectID, 0, true, &currentUser.User, recipients)
 	}
 
 	c.JSON(200, gin.H{
@@ -350,8 +356,19 @@ func (h *Handler) deleteProject(c *gin.Context) {
 // the reminders of chores whose audience or assignees changed (they were removed
 // inside the transaction), tells users who lost a chore to drop it, and tells
 // everybody who could see the project before or after to refresh.
+//
+// An audience update with affected tasks takes a durable post-processing row
+// (result.EventID) carrying its access version; the AccessProcessor performs the
+// work from that snapshot, retries persistently and survives restarts, and old
+// versions cannot undo newer ones. Updates without such a row (renames, colors,
+// audience changes that affect no task) keep the inline best-effort behavior.
 func (h *Handler) afterAccessChange(c *gin.Context, circleID int, project *pModel.Project, result *chRepo.ProjectAccessResult, user *uModel.User) {
 	log := logging.FromContext(c)
+
+	if result != nil && result.EventID > 0 && h.accessProcessor != nil {
+		h.accessProcessor.Dispatch(c, result.EventID)
+		return
+	}
 
 	if result != nil && h.nPlanner != nil {
 		for _, choreID := range result.NotificationChoreIDs {
@@ -381,7 +398,7 @@ func (h *Handler) afterAccessChange(c *gin.Context, circleID int, project *pMode
 		}
 		sort.Ints(choreIDs)
 		for _, choreID := range choreIDs {
-			broadcaster.BroadcastChoreAccessRevoked(circleID, choreID, names[choreID], user, result.Revocations[choreID])
+			broadcaster.BroadcastChoreAccessRevoked(circleID, choreID, names[choreID], user, 0, result.Revocations[choreID])
 		}
 	}
 
@@ -408,7 +425,7 @@ func (h *Handler) afterAccessChange(c *gin.Context, circleID int, project *pMode
 		}
 		sort.Ints(recipients)
 	}
-	broadcaster.BroadcastProjectUpdated(circleID, project.ID, accessChanged, user, recipients)
+	broadcaster.BroadcastProjectUpdated(circleID, project.ID, 0, accessChanged, user, recipients)
 }
 
 func Routes(r *gin.Engine, h *Handler, multiAuthMiddleware *auth.MultiAuthMiddleware) {
